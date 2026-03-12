@@ -1,0 +1,43 @@
+# Prefect Project Configuration
+name: datalake-dataload
+version: 1
+
+# Build configuration - no remote storage needed for local development
+build: null
+push: null
+pull: null
+
+# Deployments - All three data loading flows
+deployments:
+  - name: term-raw-daily
+    tags: ["raw", "term", "peoplesoft"]
+    description: "Daily term data load at 1:00 AM ET"
+    entrypoint: flows/term_raw_flow.py:term_raw_flow
+    work_pool:
+      name: k8s-pool
+    schedules:
+      - cron: "0 1 * * *"
+        timezone: "America/New_York"
+        active: true
+
+  - name: course-raw-daily
+    tags: ["raw", "course", "snaplogic"]
+    description: "Daily course data load at 2:00 AM ET"
+    entrypoint: flows/course_raw_flow.py:course_raw_flow
+    work_pool:
+      name: k8s-pool
+    schedules:
+      - cron: "0 2 * * *"
+        timezone: "America/New_York"
+        active: true
+
+  - name: person-raw-daily
+    tags: ["raw", "person", "snaplogic"]
+    description: "Daily person data load at 3:00 AM ET"
+    entrypoint: flows/person_raw_flow.py:person_raw_flow
+    work_pool:
+      name: k8s-pool
+    schedules:
+      - cron: "0 3 * * *"
+        timezone: "America/New_York"
+        active: true
