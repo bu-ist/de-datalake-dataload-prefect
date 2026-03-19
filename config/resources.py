@@ -104,29 +104,29 @@ class SnapLogicCourseApiResource:
         }
 
 
-class SnapLogicPersonApiResource:
+class DEPersonApiResource:
     """
-    Resource for storing SnapLogic API configuration and authentication
+    Resource for storing Data Engineering Person API configuration and authentication
     details for person-related data.
 
     Attributes:
-        url (str): The base URL of the SnapLogic endpoint for person data.
-        token (str): The API key for authenticating SnapLogic requests.
+        url (str): The base URL of the Data Engineering Person API endpoint.
+        token (str): The API key for authenticating Data Engineering Person API requests.
         cs_env (str): The Campus Solutions environment.
     """
 
     @staticmethod
     def get_config() -> Dict[str, any]:
         """
-        Get SnapLogic Person API configuration.
+        Get Data Engineering Person API configuration.
 
         Returns:
             Dict containing URL, headers, and environment
         """
         return {
-            "url": settings.snaplogic_person_url,
+            "url": settings.de_person_api_url,
             "headers": {
-                "x-api-key": settings.snaplogic_person_key,
+                "x-api-key": settings.de_person_api_key,
                 "User-Agent": "Mozilla/5.0"
             },
             "cs_env": settings.cs_env

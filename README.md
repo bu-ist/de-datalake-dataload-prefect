@@ -4,11 +4,11 @@ A Prefect workflow orchestration project for managing data lake loading operatio
 
 ## Project Overview
 
-This project handles ETL operations for loading data from various sources (PeopleSoft, SnapLogic, VDS, SAP) into a PostgreSQL data lake. It consists of three main flows:
+This project handles ETL operations for loading data from various sources (PeopleSoft, Data Engineering API, SnapLogic, VDS, SAP) into a PostgreSQL data lake. It consists of three main flows:
 
 1. **Term Raw Flow** - Loads term data from PeopleSoft (runs at 1:00 AM ET daily)
 2. **Course Raw Flow** - Loads course data from SnapLogic (runs at 2:00 AM ET daily)
-3. **Person Raw Flow** - Loads person data from multiple sources (runs at 3:00 AM ET daily)
+3. **Person Raw Flow** - Loads person data from Data Engineering Person API and multiple sources (runs at 3:00 AM ET daily)
 
 ## Project Structure
 
@@ -79,14 +79,18 @@ The project uses a three-layer data architecture for all pipelines (Person, Cour
 | `POSTGRES_USER` | Username |
 | `POSTGRES_PASS` | Password |
 
-### SnapLogic APIs
+### SnapLogic Course API
 | Variable | Description |
 |----------|-------------|
-| `SNAPLOGIC_PERSON_URL` | API URL for SnapLogic person data |
-| `SNAPLOGIC_PERSON_KEY` | API token for SnapLogic person data |
 | `SNAPLOGIC_COURSE_URL` | API URL for SnapLogic course data |
 | `SNAPLOGIC_COURSE_KEY` | API token for SnapLogic course data |
-| `CS_ENV`               | Campus Solutions environment for SnapLogic (`test`, `prod`, etc.) |
+
+### Data Engineering Person API
+| Variable | Description |
+|----------|-------------|
+| `DE_PERSON_API_URL` | API URL for Data Engineering Person API |
+| `DE_PERSON_API_KEY` | API token for Data Engineering Person API |
+| `CS_ENV`            | Campus Solutions environment (`test`, `prod`, etc.) |
 
 ### PeopleSoft APIs
 | Variable | Description |
@@ -114,7 +118,7 @@ The project uses a three-layer data architecture for all pipelines (Person, Cour
 - Python 3.9 or higher (requires Python >=3.9, <3.14)
 - Prefect 2.14.0 or higher
 - PostgreSQL database
-- Access to PeopleSoft, SnapLogic, VDS, and SAP APIs
+- Access to PeopleSoft, Data Engineering Person API, SnapLogic, VDS, and SAP APIs
 
 ## Setup
 
@@ -144,7 +148,8 @@ Required environment variables:
 - **PostgreSQL**: `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASS`
 - **Campus Solutions**: `CS_ENV`
 - **PeopleSoft**: `PEOPLE_SOFT_USER`, `PEOPLE_SOFT_PASS`
-- **SnapLogic**: `SNAPLOGIC_COURSE_URL`, `SNAPLOGIC_COURSE_KEY`, `SNAPLOGIC_PERSON_URL`, `SNAPLOGIC_PERSON_KEY`
+- **SnapLogic Course API**: `SNAPLOGIC_COURSE_URL`, `SNAPLOGIC_COURSE_KEY`
+- **Data Engineering Person API**: `DE_PERSON_API_URL`, `DE_PERSON_API_KEY`
 - **VDS**: `VDS_URL`, `VDS_USERNAME`, `VDS_PASSWORD`
 - **SAP**: `SAP_URL`, `SAP_KEY`
 
@@ -250,12 +255,12 @@ prefect deployment run 'person-raw-flow/person-raw-daily'
 
 ### Person Raw Flow
 - **Schedule**: Daily at 3:00 AM ET
-- **Sources**: PeopleSoft, SAP, VDS (commented out), SnapLogic Person API
+- **Sources**: PeopleSoft, SAP, VDS (commented out), Data Engineering Person API
 - **Target**: `person_raw.person_data` table
 - **Description**:
   1. Fetches BUIDs from PeopleSoft and SAP
   2. Queries PeopleSoft for uidCarTerm data for each BUID
-  3. Batches uidCarTerm data and sends to SnapLogic Person API
+  3. Batches BUIDs and sends to Data Engineering Person API
   4. Inserts person data with sensitive fields removed
 
 ## Development

@@ -26,8 +26,10 @@ class Settings(BaseSettings):
     # SnapLogic APIs
     snaplogic_course_url: str
     snaplogic_course_key: str
-    snaplogic_person_url: str
-    snaplogic_person_key: str
+
+    # Data Engineering Person API
+    de_person_api_url: str
+    de_person_api_key: str
 
     # VDS API
     vds_url: str

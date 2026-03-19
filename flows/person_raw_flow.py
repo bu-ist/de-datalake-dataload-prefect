@@ -14,7 +14,7 @@ from prefect.logging import get_run_logger
 import asyncpg
 from config.resources import (
     AsyncpgPoolResource,
-    SnapLogicPersonApiResource,
+    DEPersonApiResource,
     PsQueryResource,
     VDSApiResource,
     SAPApiResource,
@@ -25,43 +25,44 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 """
-    Create a Prefect flow that retrieves person data from the SnapLogic API
+    Create a Prefect flow that retrieves person data from the Data Engineering Person API
     and prepares it for insertion into the Postgres database.
 
     steps:
     1. Extract BUIDs.
     2. For each BUID, query PeopleSoft to get uidCarTerm data.
-    3. Batch uidCarTerm data and send to SnapLogic Person API to get person details.
+    3. Batch uidCarTerm data and send to Data Engineering Person API to get person details.
     4. Insert person data in the Postgres database.
 """
 @flow(
     name="person-raw-flow",
-    description="Retrieves person data from SnapLogic API and inserts into Postgres database",
+    description="Retrieves person data from Data Engineering Person API and inserts into Postgres database",
     retries=1,
     retry_delay_seconds=300,
     log_prints=True
 )
 async def person_raw_flow():
     """
-    A Prefect flow that retrieves person data from the SnapLogic API
+    A Prefect flow that retrieves person data from the Data Engineering Person API
     and prepares it for insertion into the Postgres database.
 
     Steps:
     1. Extract BUIDs from PeopleSoft, VDS, and SAP APIs.
     2. For each BUID, query PeopleSoft to get uidCarTerm data.
-    3. Batch uidCarTerm data and send to SnapLogic Person API to get person details.
+    3. Batch uidCarTerm data and send to Data Engineering Person API to get person details.
     4. Insert person data in the Postgres database.
     """
     logger = get_run_logger()
 
-    UIDCARTERM_GROUP_SIZE = 1000 #1900
+    UIDCARTERM_BATCH_SIZE = 400
+    BUID_BATCH_SIZE = 100
     PSQUERY_SEMAPHORE_LIMIT = 10 #10
-    SNAPLOGIC_SEMAPHORE_LIMIT = 8 #8
+    PERSON_API_SEMAPHORE_LIMIT = 5 #8
     INSERT_SEMAPHORE_LIMIT = 100 #25
 
     # Get resource configurations
     asyncpg_pool_config = AsyncpgPoolResource.get_pool_config()
-    snaplogic_person_config = SnapLogicPersonApiResource.get_config()
+    person_api_config = DEPersonApiResource.get_config()
     ps_query_config = PsQueryResource.get_config()
     vds_api_config = VDSApiResource.get_config()
     sap_api_config = SAPApiResource.get_config()
@@ -70,10 +71,12 @@ async def person_raw_flow():
 
     metrics = {
         "ps_queried": 0, "ps_success": 0, "ps_empty": 0,
-        "uidcarterm_total": 0, "uidcarterm_estimated": 0,
-        "snaplogic_batches_started": 0, "snaplogic_batches_completed": 0, "snaplogic_batches_estimated": 0,
+        "students_unique": 0, "uidcarterm_total": 0, "uidcarterm_estimated": 0,
+        "buids_only_count": 0, "buids_only_estimated": 0,
+        "uidcarterm_batches_sent": 0, "uidcarterm_batches_completed": 0,
+        "buid_batches_sent": 0, "buid_batches_completed": 0,
         "persons_received": 0, "insert_success": 0, "insert_skipped": 0,
-        "errors": {"ps": 0, "snap": 0, "db": 0},
+        "errors": {"ps": 0, "person_api": 0, "db": 0},
         "start_time": datetime.now(), "done": False
     }
 
@@ -142,12 +145,12 @@ async def person_raw_flow():
     #TODO: Any failed BUIDs will go into the person_live_update queue for reprocessing
 
     ps_sem = asyncio.Semaphore(PSQUERY_SEMAPHORE_LIMIT)
-    snap_sem = asyncio.Semaphore(SNAPLOGIC_SEMAPHORE_LIMIT)
+    person_api_sem = asyncio.Semaphore(PERSON_API_SEMAPHORE_LIMIT)
     insert_sem = asyncio.Semaphore(INSERT_SEMAPHORE_LIMIT)
 
-    uidCarTerms, running_snap = [], []
-    threshold_event, all_ps_done = asyncio.Event(), asyncio.Event()
-    # Set max queue size to prevent memory overflow when inserts are slower than snaplogic returns
+    uidCarTerms, buids_only, running_person_api = [], [], []
+    uidCarTerms_threshold_event, buids_threshold_event, all_ps_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    # Set max queue size to prevent memory overflow when inserts are slower than Person API returns
     insert_queue: asyncio.Queue = asyncio.Queue(maxsize=20000)
     worker_tasks = []
 
@@ -186,12 +189,18 @@ async def person_raw_flow():
                     if uidCarTerm:
                         metrics["ps_success"] += 1
                         metrics["uidcarterm_total"] += len(uidCarTerm)
+                        # Track unique students (BUIDs with term data)
+                        unique_buids_in_terms = set(term.get("CAMPUS_ID") for term in uidCarTerm if term.get("CAMPUS_ID"))
+                        metrics["students_unique"] += len(unique_buids_in_terms)
+                        uidCarTerms.append(uidCarTerm)
+                        if len([item for row in uidCarTerms for item in row]) >= UIDCARTERM_BATCH_SIZE:
+                            uidCarTerms_threshold_event.set()
                     else:
-                        uidCarTerm = [{"CAMPUS_ID": buid}]
                         metrics["ps_empty"] += 1
-                    uidCarTerms.append(uidCarTerm)
-                    if len([item for row in uidCarTerms for item in row]) >= UIDCARTERM_GROUP_SIZE:
-                        threshold_event.set()
+                        metrics["buids_only_count"] += 1
+                        buids_only.append(buid)
+                        if len(buids_only) >= BUID_BATCH_SIZE:
+                            buids_threshold_event.set()
                     break
                 except Exception as e:
                     if attempt < max_retries:
@@ -201,13 +210,13 @@ async def person_raw_flow():
                         logger.error(f"PSQuery error for BUID {buid}: {e}")
                         return e
 
-    async def query_snap_and_insert(uidCarTerms: str, snap_client: httpx.AsyncClient, max_retries: int = 5, base_delay: int = 10) -> Optional[int]:
+    async def query_person_api_and_insert(data_payload: dict, person_api_client: httpx.AsyncClient, max_retries: int = 5, base_delay: int = 10) -> Optional[int]:
         """
-        Query SnapLogic personBatch with a batch of uidCarTerm records, then enqueue insert_person tasks.
+        Query Data Engineering Person API with a batch of buids or uidCarTerms, then enqueue insert_person tasks.
 
         Args:
-            uidCarTerms (str): JSON-like string representation of uidCarTerm data batch.
-            snap_client (httpx.AsyncClient): HTTP client for making the SnapLogic request.
+            data_payload (dict): Dictionary containing the API request payload.
+            person_api_client (httpx.AsyncClient): HTTP client for making the Person API request.
             max_retries (int, optional): Maximum number of retry attempts for API or network errors.
             base_delay (int, optional): Base delay in seconds between retries, exponentially increased.
 
@@ -215,25 +224,30 @@ async def person_raw_flow():
             Optional[int]: Number of person records retrieved, or an exception if failed after retries.
 
         Raises:
-            httpx.HTTPError: If the SnapLogic API request fails after all retries.
+            httpx.HTTPError: If the Person API request fails after all retries.
             json.JSONDecodeError: If the response is not a valid JSON.
         """
-        async with snap_sem:
-            metrics["snaplogic_batches_started"] += 1
+        async with person_api_sem:
+            metrics["uidcarterm_batches_sent"] += 1 if "student" in data_payload else 0
+            metrics["buid_batches_sent"] += 1 if "buids" in data_payload else 0
             for attempt in range(1, max_retries + 1):
                 try:
-                    #TODO: Snap takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
-                    resp = await snap_client.post(
-                        snaplogic_person_config["url"],
-                        json={"uidCarTerm": str(uidCarTerms)},
-                        params={"objects": "['student','affiliate','faculty','employee']", "csEnv": snaplogic_person_config["cs_env"]},
+                    #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
+                    resp = await person_api_client.post(
+                        person_api_config["url"],
+                        json=data_payload,
                         timeout=10000
                     )
                     resp.raise_for_status()
-                    persons = resp.json()
-                    persons = [p for p in persons if p.get("personid")] #TODO: Temp fix for glitch in SnapLogic returning empty objects
+                    response_obj = resp.json()
+                    persons = response_obj.get("data", [])
+                    persons = [p for p in persons if p.get("personid")] #TODO: Temp fix for glitch in Person API returning empty objects
                     metrics["persons_received"] += len(persons)
-                    metrics["snaplogic_batches_completed"] += 1
+                    # Track completed batches by type
+                    if "student" in data_payload:
+                        metrics["uidcarterm_batches_completed"] += 1
+                    elif "buids" in data_payload:
+                        metrics["buid_batches_completed"] += 1
 
                     # Enqueue each person for single-record insertion
                     for p in persons:
@@ -243,8 +257,8 @@ async def person_raw_flow():
                     if attempt < max_retries:
                         await asyncio.sleep(base_delay * 3 ** (attempt - 1))
                     else:
-                        metrics["errors"]["snap"] += 1
-                        logger.error(f"SnapLogic error: {e}\n{traceback.format_exc()}")
+                        metrics["errors"]["person_api"] += 1
+                        logger.error(f"Person API error: {e}\n{traceback.format_exc()}")
                         return e
 
     async def insert_worker() -> None:
@@ -264,10 +278,16 @@ async def person_raw_flow():
                     insert_queue.task_done()
                     continue
 
-                for k in ("ssn", "socialSecurityNumber", "sexualOrientation"):
-                    p.get("personBasic", {}).pop(k, None)
-                for k in ("finAid", "finAidReceived"):
-                    p.get("studentInfo", {}).pop(k, None)
+                # Safely remove sensitive fields if the parent objects exist and are dicts
+                person_basic = p.get("personBasic")
+                if person_basic and isinstance(person_basic, dict):
+                    for k in ("ssn", "socialSecurityNumber", "sexualOrientation"):
+                        person_basic.pop(k, None)
+                
+                student_info = p.get("studentInfo")
+                if student_info and isinstance(student_info, dict):
+                    for k in ("finAid", "finAidReceived"):
+                        student_info.pop(k, None)
 
                 async with insert_sem:
                     async with asyncpg_pool.acquire() as conn:
@@ -308,11 +328,22 @@ async def person_raw_flow():
                 ps_done = metrics["ps_queried"]
                 progress = ps_done / total_buids if total_buids else 0
                 total_estimated_runtime = None
-                if metrics["snaplogic_batches_completed"] > 0:
-                    est_batches_total = metrics["snaplogic_batches_estimated"]
-                    done_batches = metrics["snaplogic_batches_completed"]
-                    effective_done_batches = max(done_batches, 8)
-                    remaining_batches = max(est_batches_total - done_batches, 0)
+                
+                # Calculate estimates and ETA
+                total_batches_completed = metrics["uidcarterm_batches_completed"] + metrics["buid_batches_completed"]
+                if total_batches_completed > 0:
+                    # Estimate total batches needed
+                    if ps_done > 0:
+                        avg_terms_per_student = metrics["uidcarterm_total"] / metrics["ps_success"] if metrics["ps_success"] > 0 else 0
+                        est_total_terms = int(avg_terms_per_student * metrics["ps_success"] + (total_buids - ps_done) * avg_terms_per_student)
+                        est_term_batches = math.ceil(est_total_terms / UIDCARTERM_BATCH_SIZE)
+                        est_buid_batches = math.ceil((total_buids - metrics["students_unique"]) / BUID_BATCH_SIZE)
+                        est_batches_total = est_term_batches + est_buid_batches
+                    else:
+                        est_batches_total = 1
+                    
+                    effective_done_batches = max(total_batches_completed, 1)
+                    remaining_batches = max(est_batches_total - total_batches_completed, 0)
                     avg_batch_time = elapsed / effective_done_batches
                     eta = avg_batch_time * remaining_batches
                     total_estimated_runtime = elapsed + eta
@@ -330,37 +361,74 @@ async def person_raw_flow():
                     f"{int((elapsed%3600)//60):02}:"
                     f"{int(elapsed%60):02}"
                 )
+                
+                # Calculate queue size
+                queue_size = insert_queue.qsize()
+                
+                # Calculate estimated totals
                 if ps_done > 0:
-                    avg_uid = metrics["uidcarterm_total"] / ps_done
-                    est_uid = int(avg_uid * total_buids)
-                    metrics["uidcarterm_estimated"] = est_uid
-                    metrics["snaplogic_batches_estimated"] = math.ceil(est_uid / UIDCARTERM_GROUP_SIZE)
+                    avg_terms = metrics["uidcarterm_total"] / metrics["ps_success"] if metrics["ps_success"] > 0 else 0
+                    metrics["uidcarterm_estimated"] = int(avg_terms * total_buids)
+                    metrics["buids_only_estimated"] = total_buids - metrics["students_unique"] if ps_done >= total_buids else int((metrics["ps_empty"] / ps_done) * total_buids)
+                    
+                    # Calculate estimated batch counts for display
+                    avg_terms_per_student = metrics["uidcarterm_total"] / metrics["ps_success"] if metrics["ps_success"] > 0 else 0
+                    remaining_buids = total_buids - ps_done
+                    frac_with_terms = metrics["ps_success"] / ps_done
+                    est_remaining_terms = int(remaining_buids * frac_with_terms * avg_terms_per_student)
+                    est_total_terms = metrics["uidcarterm_total"] + est_remaining_terms
+                    est_term_batches = math.ceil(est_total_terms / UIDCARTERM_BATCH_SIZE) if est_total_terms > 0 else 0
+                    est_total_buids_without_terms = int((metrics["ps_empty"] / ps_done) * total_buids)
+                    est_buid_batches = math.ceil(est_total_buids_without_terms / BUID_BATCH_SIZE) if est_total_buids_without_terms > 0 else 0
+                    est_batches_total = est_term_batches + est_buid_batches
+                else:
+                    est_term_batches = 0
+                    est_buid_batches = 0
+                    est_batches_total = 0
+                
+                # Format totals for batches
+                total_batches_sent = metrics["uidcarterm_batches_sent"] + metrics["buid_batches_sent"]
+                total_batches_completed = metrics["uidcarterm_batches_completed"] + metrics["buid_batches_completed"]
                 ps_active = PSQUERY_SEMAPHORE_LIMIT - ps_sem._value
-                snap_active = SNAPLOGIC_SEMAPHORE_LIMIT - snap_sem._value
+                person_api_active = PERSON_API_SEMAPHORE_LIMIT - person_api_sem._value
                 insert_active = INSERT_SEMAPHORE_LIMIT - insert_sem._value
                 logger.info(
-                    f"[HEARTBEAT {elapsed_str} | ETA: {eta_str}]"
-                    f"\n  PS Queries:        {ps_done:,}/{total_buids:,} ({progress*100:.1f}%) — success: {metrics['ps_success']:,} | empty: {metrics['ps_empty']:,}"
-                    f"\n  uidCarTerms:       {metrics['uidcarterm_total']:,} collected (est. {metrics['uidcarterm_estimated'] or '?'} total)"
-                    f"\n  SnapLogic Batches: {metrics['snaplogic_batches_started']:,} started / {metrics['snaplogic_batches_completed']:,} completed / est {metrics['snaplogic_batches_estimated'] or '?'} total"
-                    f"\n  Persons Returned:  {metrics['persons_received']:,}"
-                    f"\n  Inserts:           {metrics['insert_success']:,} new | {metrics['insert_skipped']:,} skipped"
-                    f"\n  Semaphores:        PS={ps_active}/{PSQUERY_SEMAPHORE_LIMIT} | Snap={snap_active}/{SNAPLOGIC_SEMAPHORE_LIMIT} | Inserts={insert_active}/{INSERT_SEMAPHORE_LIMIT}"
-                    f"\n  Errors:            PS={metrics['errors']['ps']} | Snap={metrics['errors']['snap']} | DB={metrics['errors']['db']}"
-                    f"\n  Elapsed:           {elapsed_str} | ETA: {eta_str}"
+                    f"╔═══════════════════════════════════════════════════════════════════╗"
+                    f"\n║ HEARTBEAT [{elapsed_str}] — ETA: {eta_str}               "
+                    f"\n╠═══════════════════════════════════════════════════════════════════╣"
+                    f"\n║ DATA COLLECTION                                                   "
+                    f"\n║   PS Queries:         {ps_done:>6,} / {total_buids:<6,} ({progress*100:>5.1f}%)              "
+                    f"\n║     └─ With Terms:    {metrics['ps_success']:>6,} students → {metrics['uidcarterm_total']:>6,} term records   "
+                    f"\n║     └─ Without Terms: {metrics['ps_empty']:>6,} people (BUID only)               "
+                    f"\n╠═══════════════════════════════════════════════════════════════════╣"
+                    f"\n║ API BATCHES (Person API)                                          "
+                    f"\n║   Student Batches:    {metrics['uidcarterm_batches_completed']:>3} / {est_term_batches:<3} completed                "
+                    f"\n║   BUID Batches:       {metrics['buid_batches_completed']:>3} / {est_buid_batches:<3} completed                "
+                    f"\n║   Total:              {total_batches_completed:>3} / {est_batches_total:<3} completed                "
+                    f"\n╠═══════════════════════════════════════════════════════════════════╣"
+                    f"\n║ DATABASE OPERATIONS                                               "
+                    f"\n║   Persons Received:   {metrics['persons_received']:>6,}                                   "
+                    f"\n║   Insert Queue:       {queue_size:>6,} pending                              "
+                    f"\n║   Inserted:           {metrics['insert_success']:>6,} records                            "
+                    f"\n║   Skipped:            {metrics['insert_skipped']:>6,} records                            "
+                    f"\n╠═══════════════════════════════════════════════════════════════════╣"
+                    f"\n║ RESOURCE USAGE                                                    "
+                    f"\n║   Semaphores Active:  PS={ps_active}/{PSQUERY_SEMAPHORE_LIMIT}  API={person_api_active}/{PERSON_API_SEMAPHORE_LIMIT}  Insert={insert_active}/{INSERT_SEMAPHORE_LIMIT}     "
+                    f"\n║   Errors:             PS={metrics['errors']['ps']}  API={metrics['errors']['person_api']}  DB={metrics['errors']['db']}                  "
+                    f"\n╚═══════════════════════════════════════════════════════════════════╝"
                 )
                 await asyncio.sleep(interval)
         except Exception as e:
             logger.error(f"⚠️ Heartbeat error: {e}")
 
-    async def process_uidCarTerms_batch(batch: List[List[dict]], snap_client: httpx.AsyncClient) -> None:
+    async def process_uidCarTerms_batch(batch: List[List[dict]], person_api_client: httpx.AsyncClient) -> None:
         """
-        Process a single batch of at most UIDCARTERM_GROUP_SIZE uidCarTerm records
-        by flattening and sending them to the SnapLogic personBatch task.
+        Process a single batch of at most UIDCARTERM_BATCH_SIZE uidCarTerm records
+        by flattening and sending them to the Data Engineering Person API.
 
         Args:
             batch (List[List[dict]]): A list of uidCarTerm result sets.
-            snap_client (httpx.AsyncClient): HTTP client for SnapLogic requests.
+            person_api_client (httpx.AsyncClient): HTTP client for Person API requests.
 
         Returns:
             None
@@ -371,52 +439,87 @@ async def person_raw_flow():
         flattened = [item for row in batch for item in row]
         if not flattened:
             return
-        uidCarTerms_str = "[" + ",".join("{" + ",".join(
-                f'{("BUID" if k=="CAMPUS_ID" else k)}:\"{v}\"' for k, v in item.items() if k != "attr:rownumber"
-            ) + "}" for item in flattened) + "]"
+        # Convert to API format: lowercase keys and rename CAMPUS_ID to buid
+        uid_car_term_data = [
+            {("buid" if k=="CAMPUS_ID" else k.lower()): v for k, v in item.items() if k != "attr:rownumber"}
+            for item in flattened
+        ]
+        payload = {
+            "objects": ["student", "affiliate", "faculty", "employee"],
+            "student": {"uid_car_term": uid_car_term_data}
+        }
         task = asyncio.create_task(
-            query_snap_and_insert(uidCarTerms_str, snap_client)
+            query_person_api_and_insert(payload, person_api_client)
         )
-        running_snap.append(task)
+        running_person_api.append(task)
 
-    async def monitor_uidCarTerms(snap_client: httpx.AsyncClient) -> None:
+    async def process_buids_batch(batch: List[str], person_api_client: httpx.AsyncClient) -> None:
         """
-        Monitor and submit uidCarTerm data batches to SnapLogic as they become ready,
-        waiting for either threshold_event or the completion of PS queries.
+        Process a single batch of BUIDs (without term data) and send to the Data Engineering Person API.
 
         Args:
-            snap_client (httpx.AsyncClient): HTTP client for SnapLogic requests.
+            batch (List[str]): A list of BUIDs.
+            person_api_client (httpx.AsyncClient): HTTP client for Person API requests.
+
+        Returns:
+            None
+        """
+        if not batch:
+            return
+        payload = {
+            "buids": batch,
+            "objects": ["student", "affiliate", "faculty", "employee"]
+        }
+        task = asyncio.create_task(
+            query_person_api_and_insert(payload, person_api_client)
+        )
+        running_person_api.append(task)
+
+    async def monitor_uidCarTerms(person_api_client: httpx.AsyncClient) -> None:
+        """
+        Monitor and submit uidCarTerm data batches to Data Engineering Person API as they become ready,
+        waiting for either uidCarTerms_threshold_event or buids_threshold_event or the completion of PS queries.
+
+        Args:
+            person_api_client (httpx.AsyncClient): HTTP client for Person API requests.
 
         Returns:
             None
         """
         while True:
             done, _ = await asyncio.wait(
-                [asyncio.create_task(threshold_event.wait()), asyncio.create_task(all_ps_done.wait())],
+                [asyncio.create_task(uidCarTerms_threshold_event.wait()), asyncio.create_task(buids_threshold_event.wait()), asyncio.create_task(all_ps_done.wait())],
                 return_when=asyncio.FIRST_COMPLETED)
-            if threshold_event.is_set():
-                threshold_event.clear()
+            if uidCarTerms_threshold_event.is_set():
+                uidCarTerms_threshold_event.clear()
                 snapshot = uidCarTerms.copy(); uidCarTerms.clear()
-                await process_uidCarTerms_batch(snapshot, snap_client)
+                await process_uidCarTerms_batch(snapshot, person_api_client)
+            if buids_threshold_event.is_set():
+                buids_threshold_event.clear()
+                snapshot = buids_only.copy(); buids_only.clear()
+                await process_buids_batch(snapshot, person_api_client)
             if all_ps_done.is_set():
                 #TODO: run uidcarterms evenly across all semaphores if psqueries are small. Will be important once we implement live updates
                 if uidCarTerms:
                     snapshot = uidCarTerms.copy(); uidCarTerms.clear()
-                    await process_uidCarTerms_batch(snapshot, snap_client)
+                    await process_uidCarTerms_batch(snapshot, person_api_client)
+                if buids_only:
+                    snapshot = buids_only.copy(); buids_only.clear()
+                    await process_buids_batch(snapshot, person_api_client)
                 break
 
     heartbeat = asyncio.create_task(monitor_progress())
     # Start insert workers
     worker_tasks = [asyncio.create_task(insert_worker()) for _ in range(INSERT_SEMAPHORE_LIMIT)]
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=snaplogic_person_config["headers"]) as snap_client:
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=person_api_config["headers"]) as person_api_client:
         async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=ps_query_config["headers"]) as ps_client:
-            monitor_task = asyncio.create_task(monitor_uidCarTerms(snap_client))
+            monitor_task = asyncio.create_task(monitor_uidCarTerms(person_api_client))
             await asyncio.gather(
                 *(query_ps(b, ps_client) for b in buids), return_exceptions=True)
             all_ps_done.set()
             await monitor_task
-            if running_snap:
-                await asyncio.gather(*running_snap, return_exceptions=True)
+            if running_person_api:
+                await asyncio.gather(*running_person_api, return_exceptions=True)
             # Wait for queue to drain, then signal workers to stop
             await insert_queue.join()
             for _ in worker_tasks:
@@ -424,8 +527,8 @@ async def person_raw_flow():
             await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     #TODO: Review this redundant logic (maybe replace with asyncio.TaskGroup())
-    if running_snap:
-        await asyncio.gather(*running_snap, return_exceptions=True)
+    if running_person_api:
+        await asyncio.gather(*running_person_api, return_exceptions=True)
 
     metrics["done"] = True
     await heartbeat
@@ -433,18 +536,28 @@ async def person_raw_flow():
     await asyncpg_pool.close()
 
     elapsed = (datetime.now() - metrics["start_time"]).total_seconds()
-    logger.info("\n───────────────────────────────────────────────")
-    logger.info("PERSON_RAW_FLOW RUN SUMMARY")
-    logger.info("───────────────────────────────────────────────")
-    logger.info(f"BUIDs:                 {len(buids):,}")
-    logger.info(f"PS Queries:            {metrics['ps_queried']:,} (success {metrics['ps_success']:,}, empty {metrics['ps_empty']:,})")
-    logger.info(f"uidCarTerms:           {metrics['uidcarterm_total']:,}")
-    logger.info(f"SnapLogic Batches:     {metrics['snaplogic_batches_completed']:,}/{metrics['snaplogic_batches_started'] or '?'}")
-    logger.info(f"Persons Returned:      {metrics['persons_received']:,}")
-    logger.info(f"Inserts:               {metrics['insert_success']:,} new | {metrics['insert_skipped']:,} skipped")
-    logger.info(f"Errors:                PS={metrics['errors']['ps']} | Snap={metrics['errors']['snap']} | DB={metrics['errors']['db']}")
-    logger.info(f"Duration:              {int(elapsed//3600)}h {int((elapsed%3600)//60)}m {int(elapsed%60)}s")
-    logger.info("───────────────────────────────────────────────")
+    total_batches_sent = metrics["uidcarterm_batches_sent"] + metrics["buid_batches_sent"]
+    total_batches_completed = metrics["uidcarterm_batches_completed"] + metrics["buid_batches_completed"]
+    
+    logger.info("\n╔═══════════════════════════════════════════════════════╗")
+    logger.info("║           PERSON_RAW_FLOW RUN SUMMARY                ║")
+    logger.info("╠═══════════════════════════════════════════════════════╣")
+    logger.info(f"║ Total BUIDs Processed:     {len(buids):>6,}                     ║")
+    logger.info(f"║   ├─ Students (w/ terms):  {metrics['students_unique']:>6,}                     ║")
+    logger.info(f"║   │    └─ Term records:    {metrics['uidcarterm_total']:>6,}                     ║")
+    logger.info(f"║   └─ BUIDs only:           {metrics['buids_only_count']:>6,}                     ║")
+    logger.info("╠═══════════════════════════════════════════════════════╣")
+    logger.info(f"║ API Batches:               {total_batches_completed:>3} / {total_batches_sent:<3} completed         ║")
+    logger.info(f"║   ├─ Student batches:      {metrics['uidcarterm_batches_completed']:>3} / {metrics['uidcarterm_batches_sent']:<3} completed         ║")
+    logger.info(f"║   └─ BUID batches:         {metrics['buid_batches_completed']:>3} / {metrics['buid_batches_sent']:<3} completed         ║")
+    logger.info("╠═══════════════════════════════════════════════════════╣")
+    logger.info(f"║ Persons Returned:          {metrics['persons_received']:>6,}                     ║")
+    logger.info(f"║ Records Inserted:          {metrics['insert_success']:>6,}                     ║")
+    logger.info(f"║ Records Skipped:           {metrics['insert_skipped']:>6,}                     ║")
+    logger.info("╠═══════════════════════════════════════════════════════╣")
+    logger.info(f"║ Errors: PS={metrics['errors']['ps']}  API={metrics['errors']['person_api']}  DB={metrics['errors']['db']}                        ║")
+    logger.info(f"║ Duration: {int(elapsed//3600)}h {int((elapsed%3600)//60)}m {int(elapsed%60)}s                              ║")
+    logger.info("╚═══════════════════════════════════════════════════════╝")
 
     return {
         "status": "success",
