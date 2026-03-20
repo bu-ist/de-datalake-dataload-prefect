@@ -9,7 +9,8 @@ import traceback
 import logging
 from datetime import datetime
 from typing import Optional, List
-from prefect import flow
+from prefect import flow, task
+from prefect.cache_policies import NONE as NO_CACHE
 from prefect.logging import get_run_logger
 import asyncpg
 from config.resources import (
@@ -22,6 +23,410 @@ from config.resources import (
 )
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+@task(name="fetch-buids-from-peoplesoft", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
+async def fetch_buids_from_peoplesoft_task(ps_query_config: dict) -> List[str]:
+    """
+    Fetch BUIDs from PeopleSoft BU_PARM_0216_QRY query.
+    
+    Args:
+        ps_query_config (dict): PeopleSoft query configuration.
+        
+    Returns:
+        List[str]: List of BUIDs retrieved from PeopleSoft.
+    """
+    logger = get_run_logger()
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            ps_url(ps_query_config["csEnv"], "BU_PARM_0216_QRY"),
+            params={"isconnectedquery": "N", "maxrows": 0, "json_resp": "true"},
+            headers=ps_query_config["headers"],
+            timeout=30,
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("data", {}).get("query", {}).get("rows", [])
+    buids = [row.get("CAMPUS_ID") for row in rows if row.get("CAMPUS_ID")]
+    logger.info(f"Retrieved {len(buids)} BUIDs from BU_PARM_0216_QRY.")
+    return buids
+
+
+@task(name="fetch-buids-from-sap", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
+async def fetch_buids_from_sap_task(sap_api_config: dict) -> List[str]:
+    """
+    Fetch BUIDs from SAP Z_HR_EMPLOYEE_OBJ_LIST API.
+    
+    Args:
+        sap_api_config (dict): SAP API configuration.
+        
+    Returns:
+        List[str]: List of active employee BUIDs from SAP.
+    """
+    logger = get_run_logger()
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            sap_api_config["url"],
+            params={"BAPIName": "Z_HR_EMPLOYEE_OBJ_LIST", "account": "HR"},
+            json={},
+            headers=sap_api_config["headers"],
+            timeout=30,
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("ET_EMP_LIST", [])
+    buids = [row.get("BUID") for row in rows if row.get("EMP_STATUS") == "3 - Active" and row.get("BUID")]
+    logger.info(f"Retrieved {len(buids)} BUIDs from SAP Z_HR_EMPLOYEE_OBJ_LIST.")
+    return buids
+
+
+async def query_ps_single(
+    buid: str,
+    ps_client: httpx.AsyncClient,
+    ps_query_config: dict,
+    ps_sem: asyncio.Semaphore,
+    metrics: dict,
+    uidCarTerms: list,
+    buids_only: list,
+    uidCarTerms_threshold_event: asyncio.Event,
+    buids_threshold_event: asyncio.Event,
+    UIDCARTERM_BATCH_SIZE: int,
+    BUID_BATCH_SIZE: int,
+    logger
+) -> Optional[Exception]:
+    """
+    Query the PeopleSoft API for all uidCarTerm data associated with a given BUID.
+
+    Args:
+        buid (str): The unique BUID to fetch data for.
+        ps_client (httpx.AsyncClient): HTTP client for making the API request.
+        ps_query_config (dict): PeopleSoft query configuration.
+        ps_sem (asyncio.Semaphore): Semaphore to limit concurrent PS queries.
+        metrics (dict): Shared metrics dictionary.
+        uidCarTerms (list): Shared list to append term data.
+        buids_only (list): Shared list to append BUIDs without term data.
+        uidCarTerms_threshold_event (asyncio.Event): Event to signal batch threshold.
+        buids_threshold_event (asyncio.Event): Event to signal BUID batch threshold.
+        UIDCARTERM_BATCH_SIZE (int): Batch size for uidCarTerms.
+        BUID_BATCH_SIZE (int): Batch size for BUIDs only.
+        logger: Logger instance.
+
+    Returns:
+        Optional[Exception]: Returns an exception if all retries fail, else None.
+    """
+    async with ps_sem:
+        metrics["ps_queried"] += 1
+        for attempt in range(1, 6):  # 5 retries
+            try:
+                req = {"isconnectedquery": "N", "maxrows": 0, "prompt_uniquepromptname": "BUID", "prompt_fieldvalue": buid, "json_resp": "true"}
+                resp = await ps_client.get(ps_url(ps_query_config["csEnv"], "BU_TERM_STD_FULL_TERM"), params=req, timeout=30)
+                resp.raise_for_status()
+                uidCarTerm = resp.json()['data']['query']['rows']
+
+                #TODO: Add logic for Faculty Terms. Consider if buid is a student and faculty for Terms
+                # req = {"isconnectedquery": "N", "maxrows": 0, "prompt_uniquepromptname": "EMPLID", "prompt_fieldvalue": buid, "json_resp": "true"}
+                # resp = await ps_client.get(ps_url(ps_query_config["csEnv"], "BU_FACULTY_GET"), params=req, timeout=30)
+                # resp.raise_for_status()
+                # facultyTerms = resp.json()['data']['query']['rows']
+
+                if uidCarTerm:
+                    metrics["ps_success"] += 1
+                    metrics["uidcarterm_total"] += len(uidCarTerm)
+                    # Track unique students (BUIDs with term data)
+                    unique_buids_in_terms = set(term.get("CAMPUS_ID") for term in uidCarTerm if term.get("CAMPUS_ID"))
+                    metrics["students_unique"] += len(unique_buids_in_terms)
+                    uidCarTerms.append(uidCarTerm)
+                    if len([item for row in uidCarTerms for item in row]) >= UIDCARTERM_BATCH_SIZE:
+                        uidCarTerms_threshold_event.set()
+                else:
+                    metrics["ps_empty"] += 1
+                    metrics["buids_only_count"] += 1
+                    buids_only.append(buid)
+                    if len(buids_only) >= BUID_BATCH_SIZE:
+                        buids_threshold_event.set()
+                return None
+            except Exception as e:
+                if attempt < 5:
+                    await asyncio.sleep(10 * 3 ** (attempt - 1))
+                else:
+                    metrics["errors"]["ps"] += 1
+                    logger.error(f"PSQuery error for BUID {buid}: {e}")
+                    return e
+
+
+@task(name="query-all-buids-from-peoplesoft", retries=1, retry_delay_seconds=30, cache_policy=NO_CACHE, tags=["query-buid-terms"])
+async def query_all_buids_task(
+    buids: List[str],
+    ps_client: httpx.AsyncClient,
+    ps_query_config: dict,
+    ps_sem: asyncio.Semaphore,
+    metrics: dict,
+    uidCarTerms: list,
+    buids_only: list,
+    uidCarTerms_threshold_event: asyncio.Event,
+    buids_threshold_event: asyncio.Event,
+    UIDCARTERM_BATCH_SIZE: int,
+    BUID_BATCH_SIZE: int
+) -> None:
+    """
+    Query PeopleSoft for all BUIDs concurrently, respecting semaphore limits.
+
+    Args:
+        buids (List[str]): List of all BUIDs to query.
+        ps_client (httpx.AsyncClient): HTTP client for making the API request.
+        ps_query_config (dict): PeopleSoft query configuration.
+        ps_sem (asyncio.Semaphore): Semaphore to limit concurrent PS queries.
+        metrics (dict): Shared metrics dictionary.
+        uidCarTerms (list): Shared list to append term data.
+        buids_only (list): Shared list to append BUIDs without term data.
+        uidCarTerms_threshold_event (asyncio.Event): Event to signal batch threshold.
+        buids_threshold_event (asyncio.Event): Event to signal BUID batch threshold.
+        UIDCARTERM_BATCH_SIZE (int): Batch size for uidCarTerms.
+        BUID_BATCH_SIZE (int): Batch size for BUIDs only.
+    """
+    logger = get_run_logger()
+    logger.info(f"Querying PeopleSoft for {len(buids)} BUIDs...")
+    await asyncio.gather(
+        *(query_ps_single(
+            buid=buid,
+            ps_client=ps_client,
+            ps_query_config=ps_query_config,
+            ps_sem=ps_sem,
+            metrics=metrics,
+            uidCarTerms=uidCarTerms,
+            buids_only=buids_only,
+            uidCarTerms_threshold_event=uidCarTerms_threshold_event,
+            buids_threshold_event=buids_threshold_event,
+            UIDCARTERM_BATCH_SIZE=UIDCARTERM_BATCH_SIZE,
+            BUID_BATCH_SIZE=BUID_BATCH_SIZE,
+            logger=logger
+        ) for buid in buids),
+        return_exceptions=True
+    )
+    logger.info(f"Completed querying {len(buids)} BUIDs from PeopleSoft")
+
+
+@task(
+    name="process-uidcarterms-batch",
+    retries=5,
+    retry_delay_seconds=10,
+    task_run_name="uidCarTerms-batch-{batch_id}",
+    cache_policy=NO_CACHE,
+    tags=["get-person-batch"]
+)
+async def process_uidCarTerms_batch_task(
+    batch: List[List[dict]],
+    batch_id: int,
+    person_api_client: httpx.AsyncClient,
+    person_api_config: dict,
+    person_api_sem: asyncio.Semaphore,
+    metrics: dict
+) -> List[dict]:
+    """
+    Process a single batch of uidCarTerm records by sending to Person API.
+
+    Args:
+        batch (List[List[dict]]): A list of uidCarTerm result sets.
+        batch_id (int): Unique identifier for this batch.
+        person_api_client (httpx.AsyncClient): HTTP client for Person API requests.
+        person_api_config (dict): Person API configuration.
+        person_api_sem (asyncio.Semaphore): Semaphore to limit concurrent API calls.
+        metrics (dict): Shared metrics dictionary.
+
+    Returns:
+        List[dict]: List of person records retrieved from API.
+    """
+    logger = get_run_logger()
+    flattened = [item for row in batch for item in row]
+    if not flattened:
+        logger.info("📦 Empty batch - skipping")
+        return []
+    
+    # Extract unique BUIDs and count terms
+    unique_buids = set(item.get("CAMPUS_ID") for item in flattened if item.get("CAMPUS_ID"))
+    num_terms = len(flattened)
+    num_students = len(unique_buids)
+    
+    logger.info(f"📦 Processing batch {batch_id}: {num_students} students, {num_terms} term records")
+    
+    # Convert to API format: lowercase keys and rename CAMPUS_ID to buid
+    uid_car_term_data = [
+        {("buid" if k=="CAMPUS_ID" else k.lower()): v for k, v in item.items() if k != "attr:rownumber"}
+        for item in flattened
+    ]
+    payload = {
+        "objects": ["student", "affiliate", "faculty", "employee"],
+        "student": {"uid_car_term": uid_car_term_data}
+    }
+    
+    async with person_api_sem:
+        metrics["uidcarterm_batches_sent"] += 1
+        #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
+        resp = await person_api_client.post(
+            person_api_config["url"],
+            json=payload,
+            timeout=10000
+        )
+        resp.raise_for_status()
+        response_obj = resp.json()
+        persons = response_obj.get("data", [])
+        persons = [p for p in persons if p.get("personid")]
+        metrics["persons_received"] += len(persons)
+        metrics["uidcarterm_batches_completed"] += 1
+        
+        logger.info(f"✅ Batch {batch_id} complete: Retrieved {len(persons)} person records from {num_students} students with {num_terms} terms")
+        return persons
+
+
+@task(
+    name="process-buids-batch",
+    retries=5,
+    retry_delay_seconds=10,
+    task_run_name="buids-batch-{batch_id}",
+    cache_policy=NO_CACHE,
+    tags=["get-person-batch"]
+)
+async def process_buids_batch_task(
+    batch: List[str],
+    batch_id: int,
+    person_api_client: httpx.AsyncClient,
+    person_api_config: dict,
+    person_api_sem: asyncio.Semaphore,
+    metrics: dict
+) -> List[dict]:
+    """
+    Process a single batch of BUIDs (without term data) by sending to Person API.
+
+    Args:
+        batch (List[str]): A list of BUIDs.
+        batch_id (int): Unique identifier for this batch.
+        person_api_client (httpx.AsyncClient): HTTP client for Person API requests.
+        person_api_config (dict): Person API configuration.
+        person_api_sem (asyncio.Semaphore): Semaphore to limit concurrent API calls.
+        metrics (dict): Shared metrics dictionary.
+
+    Returns:
+        List[dict]: List of person records retrieved from API.
+    """
+    logger = get_run_logger()
+    if not batch:
+        logger.info("📦 Empty batch - skipping")
+        return []
+    
+    num_buids = len(batch)
+    logger.info(f"📦 Processing batch {batch_id}: {num_buids} BUIDs (no term data)")
+    
+    payload = {
+        "buids": batch,
+        "objects": ["student", "affiliate", "faculty", "employee"]
+    }
+    
+    async with person_api_sem:
+        metrics["buid_batches_sent"] += 1
+        #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
+        resp = await person_api_client.post(
+            person_api_config["url"],
+            json=payload,
+            timeout=10000
+        )
+        resp.raise_for_status()
+        response_obj = resp.json()
+        persons = response_obj.get("data", [])
+        persons = [p for p in persons if p.get("personid")]
+        metrics["persons_received"] += len(persons)
+        metrics["buid_batches_completed"] += 1
+        
+        logger.info(f"✅ Batch {batch_id} complete: Retrieved {len(persons)} person records from {num_buids} BUIDs")
+        return persons
+
+
+@task(
+    name="insert-persons-batch",
+    retries=3,
+    retry_delay_seconds=10,
+    task_run_name="insert-{batch_type}-batch-{batch_id}",
+    cache_policy=NO_CACHE,
+    tags=["insert-persons"]
+)
+async def insert_persons_batch_task(
+    persons: List[dict],
+    batch_id: int,
+    batch_type: str,
+    asyncpg_pool,
+    insert_sem: asyncio.Semaphore,
+    metrics: dict
+) -> dict:
+    """
+    Insert a batch of person records into the database.
+
+    Args:
+        persons (List[dict]): List of person records to insert.
+        batch_id (int): Unique identifier for this batch.
+        batch_type (str): Type of batch ("uidcarterms" or "buids").
+        asyncpg_pool: Database connection pool.
+        insert_sem (asyncio.Semaphore): Semaphore to limit concurrent inserts.
+        metrics (dict): Shared metrics dictionary.
+
+    Returns:
+        dict: Summary with inserted count, skipped count, and error count.
+    """
+    logger = get_run_logger()
+    inserted_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    num_persons = len(persons)
+    logger.info(f"💾 Starting insert for batch {batch_id} ({batch_type}): {num_persons} person records")
+    
+    for p in persons:
+        uid = p.get("personid")
+        if not uid:
+            skipped_count += 1
+            continue
+
+        # Safely remove sensitive fields if the parent objects exist and are dicts
+        person_basic = p.get("personBasic")
+        if person_basic and isinstance(person_basic, dict):
+            for k in ("ssn", "socialSecurityNumber", "sexualOrientation"):
+                person_basic.pop(k, None)
+        
+        student_info = p.get("studentInfo")
+        if student_info and isinstance(student_info, dict):
+            for k in ("finAid", "finAidReceived"):
+                student_info.pop(k, None)
+
+        try:
+            async with insert_sem:
+                async with asyncpg_pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO person_raw.person_data (bu_uid, person_data)
+                        VALUES ($1, $2::jsonb)
+                        """,
+                        uid,
+                        json.dumps(p),
+                    )
+            inserted_count += 1
+        except Exception as e:
+            metrics["errors"]["db"] += 1
+            error_count += 1
+            logger.error(f"❌ Insert failed for person {uid}: {e}")
+    
+    metrics["insert_success"] += inserted_count
+    metrics["insert_skipped"] += skipped_count
+    
+    # Log summary for this insert batch
+    if error_count > 0:
+        logger.warning(f"⚠️ Insert batch {batch_id} ({batch_type}): {inserted_count} inserted, {skipped_count} skipped, {error_count} errors")
+    else:
+        logger.info(f"✅ Insert batch {batch_id} ({batch_type}) complete: {inserted_count} inserted, {skipped_count} skipped")
+    
+    return {
+        "batch_id": batch_id,
+        "batch_type": batch_type,
+        "inserted": inserted_count,
+        "skipped": skipped_count,
+        "errors": error_count,
+        "total_attempted": num_persons
+    }
 
 
 """
@@ -54,8 +459,8 @@ async def person_raw_flow():
     """
     logger = get_run_logger()
 
-    UIDCARTERM_BATCH_SIZE = 400
-    BUID_BATCH_SIZE = 100
+    UIDCARTERM_BATCH_SIZE = 6000
+    BUID_BATCH_SIZE = 1000
     PSQUERY_SEMAPHORE_LIMIT = 10 #10
     PERSON_API_SEMAPHORE_LIMIT = 5 #8
     INSERT_SEMAPHORE_LIMIT = 100 #25
@@ -84,17 +489,8 @@ async def person_raw_flow():
 
     # Fetch BUIDs from BU_PARM_0216_QRY query
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                ps_url(ps_query_config["csEnv"], "BU_PARM_0216_QRY"),
-                params={"isconnectedquery": "N", "maxrows": 0, "json_resp": "true"},
-                headers=ps_query_config["headers"],
-                timeout=30,
-            )
-            resp.raise_for_status()
-            rows = resp.json().get("data", {}).get("query", {}).get("rows", [])
-        buids.extend([row.get("CAMPUS_ID") for row in rows if row.get("CAMPUS_ID")])
-        logger.info(f"Retrieved {len(buids)} BUIDs from BU_PARM_0216_QRY.")
+        ps_buids_task = await fetch_buids_from_peoplesoft_task(ps_query_config)
+        buids.extend(ps_buids_task)
     except Exception as e:
         logger.error(f"Failed to fetch BUIDs from PeopleSoft BU_PARM_0216_QRY: {e}")
         raise
@@ -122,19 +518,8 @@ async def person_raw_flow():
 
     # Fetch BUIDs from SAP API
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                sap_api_config["url"],
-                params={"BAPIName": "Z_HR_EMPLOYEE_OBJ_LIST", "account": "HR"},
-                json={},
-                headers=sap_api_config["headers"],
-                timeout=30,
-            )
-            resp.raise_for_status()
-            rows = resp.json().get("ET_EMP_LIST", [])
-        newBuids = [row.get("BUID") for row in rows if row.get("EMP_STATUS") == "3 - Active" and row.get("BUID")]
-        buids.extend(newBuids)
-        logger.info(f"Retrieved {len(newBuids)} BUIDs from SAP Z_HR_EMPLOYEE_OBJ_LIST.")
+        sap_buids_task = await fetch_buids_from_sap_task(sap_api_config)
+        buids.extend(sap_buids_task)
     except Exception as e:
         logger.error(f"Failed to fetch BUIDs from SAP: {e}")
         raise
@@ -148,163 +533,75 @@ async def person_raw_flow():
     person_api_sem = asyncio.Semaphore(PERSON_API_SEMAPHORE_LIMIT)
     insert_sem = asyncio.Semaphore(INSERT_SEMAPHORE_LIMIT)
 
-    uidCarTerms, buids_only, running_person_api = [], [], []
+    uidCarTerms, buids_only = [], []
     uidCarTerms_threshold_event, buids_threshold_event, all_ps_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    # Set max queue size to prevent memory overflow when inserts are slower than Person API returns
-    insert_queue: asyncio.Queue = asyncio.Queue(maxsize=20000)
-    worker_tasks = []
+    # Queue for batches waiting to be processed by Person API
+    person_api_batch_queue: asyncio.Queue = asyncio.Queue()
+    
+    # Batch counter for UI identification
+    batch_counter = {"uidcarterms": 0, "buids": 0}
+    
+    # Track all insert tasks so we can wait for them at the end
+    insert_tasks = []
+    insert_tasks_lock = asyncio.Lock()
 
-    async def query_ps(buid: str, ps_client: httpx.AsyncClient, max_retries: int = 5, base_delay: int = 10) -> Optional[Exception]:
+    async def person_api_worker(person_api_client: httpx.AsyncClient) -> None:
         """
-        Query the PeopleSoft API for all uidCarTerm data associated with a given BUID,
-        and append it to function-level list uidCarTerms.
-
-        Args:
-            buid (str): The unique BUID to fetch data for.
-            ps_client (httpx.AsyncClient): HTTP client for making the API request.
-            max_retries (int, optional): Maximum number of retry attempts for API or network errors.
-            base_delay (int, optional): Base delay in seconds between retries, exponentially increased.
-
-        Returns:
-            Optional[Exception]: Returns an exception if all retries fail, else None.
-
-        Raises:
-            httpx.HTTPError: If the PeopleSoft API request fails after all retries.
-        """
-        async with ps_sem:
-            metrics["ps_queried"] += 1
-            for attempt in range(1, max_retries + 1):
-                try:
-                    req = {"isconnectedquery": "N", "maxrows": 0, "prompt_uniquepromptname": "BUID", "prompt_fieldvalue": buid, "json_resp": "true"}
-                    resp = await ps_client.get(ps_url(ps_query_config["csEnv"], "BU_TERM_STD_FULL_TERM"), params=req, timeout=30)
-                    resp.raise_for_status()
-                    uidCarTerm = resp.json()['data']['query']['rows']
-
-                    #TODO: Add logic for Faculty Terms. Consider if buid is a student and faculty for Terms
-                    # req = {"isconnectedquery": "N", "maxrows": 0, "prompt_uniquepromptname": "EMPLID", "prompt_fieldvalue": buid, "json_resp": "true"}
-                    # resp = await ps_client.get(ps_url(ps_query_config["csEnv"], "BU_FACULTY_GET"), params=req, timeout=30)
-                    # resp.raise_for_status()
-                    # facultyTerms = resp.json()['data']['query']['rows']
-
-                    if uidCarTerm:
-                        metrics["ps_success"] += 1
-                        metrics["uidcarterm_total"] += len(uidCarTerm)
-                        # Track unique students (BUIDs with term data)
-                        unique_buids_in_terms = set(term.get("CAMPUS_ID") for term in uidCarTerm if term.get("CAMPUS_ID"))
-                        metrics["students_unique"] += len(unique_buids_in_terms)
-                        uidCarTerms.append(uidCarTerm)
-                        if len([item for row in uidCarTerms for item in row]) >= UIDCARTERM_BATCH_SIZE:
-                            uidCarTerms_threshold_event.set()
-                    else:
-                        metrics["ps_empty"] += 1
-                        metrics["buids_only_count"] += 1
-                        buids_only.append(buid)
-                        if len(buids_only) >= BUID_BATCH_SIZE:
-                            buids_threshold_event.set()
-                    break
-                except Exception as e:
-                    if attempt < max_retries:
-                        await asyncio.sleep(base_delay * 3 ** (attempt - 1))
-                    else:
-                        metrics["errors"]["ps"] += 1
-                        logger.error(f"PSQuery error for BUID {buid}: {e}")
-                        return e
-
-    async def query_person_api_and_insert(data_payload: dict, person_api_client: httpx.AsyncClient, max_retries: int = 5, base_delay: int = 10) -> Optional[int]:
-        """
-        Query Data Engineering Person API with a batch of buids or uidCarTerms, then enqueue insert_person tasks.
-
-        Args:
-            data_payload (dict): Dictionary containing the API request payload.
-            person_api_client (httpx.AsyncClient): HTTP client for making the Person API request.
-            max_retries (int, optional): Maximum number of retry attempts for API or network errors.
-            base_delay (int, optional): Base delay in seconds between retries, exponentially increased.
-
-        Returns:
-            Optional[int]: Number of person records retrieved, or an exception if failed after retries.
-
-        Raises:
-            httpx.HTTPError: If the Person API request fails after all retries.
-            json.JSONDecodeError: If the response is not a valid JSON.
-        """
-        async with person_api_sem:
-            metrics["uidcarterm_batches_sent"] += 1 if "student" in data_payload else 0
-            metrics["buid_batches_sent"] += 1 if "buids" in data_payload else 0
-            for attempt in range(1, max_retries + 1):
-                try:
-                    #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
-                    resp = await person_api_client.post(
-                        person_api_config["url"],
-                        json=data_payload,
-                        timeout=10000
-                    )
-                    resp.raise_for_status()
-                    response_obj = resp.json()
-                    persons = response_obj.get("data", [])
-                    persons = [p for p in persons if p.get("personid")] #TODO: Temp fix for glitch in Person API returning empty objects
-                    metrics["persons_received"] += len(persons)
-                    # Track completed batches by type
-                    if "student" in data_payload:
-                        metrics["uidcarterm_batches_completed"] += 1
-                    elif "buids" in data_payload:
-                        metrics["buid_batches_completed"] += 1
-
-                    # Enqueue each person for single-record insertion
-                    for p in persons:
-                        await insert_queue.put(p)
-                    return len(persons)
-                except Exception as e:
-                    if attempt < max_retries:
-                        await asyncio.sleep(base_delay * 3 ** (attempt - 1))
-                    else:
-                        metrics["errors"]["person_api"] += 1
-                        logger.error(f"Person API error: {e}\n{traceback.format_exc()}")
-                        return e
-
-    async def insert_worker() -> None:
-        """
-        Worker that pulls single person records from a queue and inserts
-        them individually, respecting the insert semaphore.
+        Worker that processes batches from the queue, one at a time.
+        Only PERSON_API_SEMAPHORE_LIMIT workers run concurrently.
+        Insert tasks are created but not awaited, allowing the worker to process
+        the next batch while inserts run concurrently (up to INSERT_SEMAPHORE_LIMIT).
         """
         while True:
-            p = await insert_queue.get()
-            if p is None:
-                insert_queue.task_done()
+            batch_item = await person_api_batch_queue.get()
+            if batch_item is None:
+                person_api_batch_queue.task_done()
                 break
+            
+            batch_type, batch_data, batch_id = batch_item
             try:
-                uid = p.get("personid")
-                if not uid:
-                    metrics["insert_skipped"] += 1
-                    insert_queue.task_done()
-                    continue
-
-                # Safely remove sensitive fields if the parent objects exist and are dicts
-                person_basic = p.get("personBasic")
-                if person_basic and isinstance(person_basic, dict):
-                    for k in ("ssn", "socialSecurityNumber", "sexualOrientation"):
-                        person_basic.pop(k, None)
+                persons = []
+                if batch_type == "uidcarterms":
+                    persons = await process_uidCarTerms_batch_task(
+                        batch=batch_data,
+                        batch_id=batch_id,
+                        person_api_client=person_api_client,
+                        person_api_config=person_api_config,
+                        person_api_sem=person_api_sem,
+                        metrics=metrics
+                    )
+                elif batch_type == "buids":
+                    persons = await process_buids_batch_task(
+                        batch=batch_data,
+                        batch_id=batch_id,
+                        person_api_client=person_api_client,
+                        person_api_config=person_api_config,
+                        person_api_sem=person_api_sem,
+                        metrics=metrics
+                    )
                 
-                student_info = p.get("studentInfo")
-                if student_info and isinstance(student_info, dict):
-                    for k in ("finAid", "finAidReceived"):
-                        student_info.pop(k, None)
-
-                async with insert_sem:
-                    async with asyncpg_pool.acquire() as conn:
-                        await conn.execute(
-                            """
-                            INSERT INTO person_raw.person_data (bu_uid, person_data)
-                            VALUES ($1, $2::jsonb)
-                            """,
-                            uid,
-                            json.dumps(p),
+                # Create insert task but DON'T await it - this allows the worker
+                # to immediately process the next batch while inserts run concurrently
+                if persons:
+                    # Add small delay to help Prefect UI show tasks in sequential lanes
+                    await asyncio.sleep(0.05)
+                    insert_task = asyncio.create_task(
+                        insert_persons_batch_task(
+                            persons=persons,
+                            batch_id=batch_id,
+                            batch_type=batch_type,
+                            asyncpg_pool=asyncpg_pool,
+                            insert_sem=insert_sem,
+                            metrics=metrics
                         )
-                metrics["insert_success"] += 1
-            except Exception:
-                metrics["errors"]["db"] += 1
-                logger.error("Single insert failed", exc_info=True)
+                    )
+                    async with insert_tasks_lock:
+                        insert_tasks.append(insert_task)
+            except Exception as e:
+                logger.error(f"Worker error processing {batch_type} batch {batch_id}: {e}")
+                metrics["errors"]["person_api"] += 1
             finally:
-                insert_queue.task_done()
+                person_api_batch_queue.task_done()
 
     async def monitor_progress(interval: int = 15) -> None:
         """
@@ -362,8 +659,8 @@ async def person_raw_flow():
                     f"{int(elapsed%60):02}"
                 )
                 
-                # Calculate queue size
-                queue_size = insert_queue.qsize()
+                # Calculate batch queue size
+                batch_queue_size = person_api_batch_queue.qsize()
                 
                 # Calculate estimated totals
                 if ps_done > 0:
@@ -405,10 +702,10 @@ async def person_raw_flow():
                     f"\n║   Student Batches:    {metrics['uidcarterm_batches_completed']:>3} / {est_term_batches:<3} completed                "
                     f"\n║   BUID Batches:       {metrics['buid_batches_completed']:>3} / {est_buid_batches:<3} completed                "
                     f"\n║   Total:              {total_batches_completed:>3} / {est_batches_total:<3} completed                "
+                    f"\n║   Batch Queue:        {batch_queue_size:>3} pending                             "
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ DATABASE OPERATIONS                                               "
                     f"\n║   Persons Received:   {metrics['persons_received']:>6,}                                   "
-                    f"\n║   Insert Queue:       {queue_size:>6,} pending                              "
                     f"\n║   Inserted:           {metrics['insert_success']:>6,} records                            "
                     f"\n║   Skipped:            {metrics['insert_skipped']:>6,} records                            "
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
@@ -420,60 +717,6 @@ async def person_raw_flow():
                 await asyncio.sleep(interval)
         except Exception as e:
             logger.error(f"⚠️ Heartbeat error: {e}")
-
-    async def process_uidCarTerms_batch(batch: List[List[dict]], person_api_client: httpx.AsyncClient) -> None:
-        """
-        Process a single batch of at most UIDCARTERM_BATCH_SIZE uidCarTerm records
-        by flattening and sending them to the Data Engineering Person API.
-
-        Args:
-            batch (List[List[dict]]): A list of uidCarTerm result sets.
-            person_api_client (httpx.AsyncClient): HTTP client for Person API requests.
-
-        Returns:
-            None
-
-        Raises:
-            json.JSONDecodeError: If JSON serialization fails.
-        """
-        flattened = [item for row in batch for item in row]
-        if not flattened:
-            return
-        # Convert to API format: lowercase keys and rename CAMPUS_ID to buid
-        uid_car_term_data = [
-            {("buid" if k=="CAMPUS_ID" else k.lower()): v for k, v in item.items() if k != "attr:rownumber"}
-            for item in flattened
-        ]
-        payload = {
-            "objects": ["student", "affiliate", "faculty", "employee"],
-            "student": {"uid_car_term": uid_car_term_data}
-        }
-        task = asyncio.create_task(
-            query_person_api_and_insert(payload, person_api_client)
-        )
-        running_person_api.append(task)
-
-    async def process_buids_batch(batch: List[str], person_api_client: httpx.AsyncClient) -> None:
-        """
-        Process a single batch of BUIDs (without term data) and send to the Data Engineering Person API.
-
-        Args:
-            batch (List[str]): A list of BUIDs.
-            person_api_client (httpx.AsyncClient): HTTP client for Person API requests.
-
-        Returns:
-            None
-        """
-        if not batch:
-            return
-        payload = {
-            "buids": batch,
-            "objects": ["student", "affiliate", "faculty", "employee"]
-        }
-        task = asyncio.create_task(
-            query_person_api_and_insert(payload, person_api_client)
-        )
-        running_person_api.append(task)
 
     async def monitor_uidCarTerms(person_api_client: httpx.AsyncClient) -> None:
         """
@@ -493,42 +736,64 @@ async def person_raw_flow():
             if uidCarTerms_threshold_event.is_set():
                 uidCarTerms_threshold_event.clear()
                 snapshot = uidCarTerms.copy(); uidCarTerms.clear()
-                await process_uidCarTerms_batch(snapshot, person_api_client)
+                if snapshot:
+                    batch_counter["uidcarterms"] += 1
+                    await person_api_batch_queue.put(("uidcarterms", snapshot, batch_counter["uidcarterms"]))
             if buids_threshold_event.is_set():
                 buids_threshold_event.clear()
                 snapshot = buids_only.copy(); buids_only.clear()
-                await process_buids_batch(snapshot, person_api_client)
+                if snapshot:
+                    batch_counter["buids"] += 1
+                    await person_api_batch_queue.put(("buids", snapshot, batch_counter["buids"]))
             if all_ps_done.is_set():
                 #TODO: run uidcarterms evenly across all semaphores if psqueries are small. Will be important once we implement live updates
                 if uidCarTerms:
                     snapshot = uidCarTerms.copy(); uidCarTerms.clear()
-                    await process_uidCarTerms_batch(snapshot, person_api_client)
+                    batch_counter["uidcarterms"] += 1
+                    await person_api_batch_queue.put(("uidcarterms", snapshot, batch_counter["uidcarterms"]))
                 if buids_only:
                     snapshot = buids_only.copy(); buids_only.clear()
-                    await process_buids_batch(snapshot, person_api_client)
+                    batch_counter["buids"] += 1
+                    await person_api_batch_queue.put(("buids", snapshot, batch_counter["buids"]))
                 break
 
     heartbeat = asyncio.create_task(monitor_progress())
-    # Start insert workers
-    worker_tasks = [asyncio.create_task(insert_worker()) for _ in range(INSERT_SEMAPHORE_LIMIT)]
+    
     async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=person_api_config["headers"]) as person_api_client:
+        # Start Person API workers (only PERSON_API_SEMAPHORE_LIMIT will run concurrently)
+        person_api_workers = [asyncio.create_task(person_api_worker(person_api_client)) for _ in range(PERSON_API_SEMAPHORE_LIMIT)]
+        
         async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=ps_query_config["headers"]) as ps_client:
             monitor_task = asyncio.create_task(monitor_uidCarTerms(person_api_client))
-            await asyncio.gather(
-                *(query_ps(b, ps_client) for b in buids), return_exceptions=True)
+            # Query all BUIDs from PeopleSoft as a single task
+            await query_all_buids_task(
+                buids=buids,
+                ps_client=ps_client,
+                ps_query_config=ps_query_config,
+                ps_sem=ps_sem,
+                metrics=metrics,
+                uidCarTerms=uidCarTerms,
+                buids_only=buids_only,
+                uidCarTerms_threshold_event=uidCarTerms_threshold_event,
+                buids_threshold_event=buids_threshold_event,
+                UIDCARTERM_BATCH_SIZE=UIDCARTERM_BATCH_SIZE,
+                BUID_BATCH_SIZE=BUID_BATCH_SIZE
+            )
             all_ps_done.set()
             await monitor_task
-            if running_person_api:
-                await asyncio.gather(*running_person_api, return_exceptions=True)
-            # Wait for queue to drain, then signal workers to stop
-            await insert_queue.join()
-            for _ in worker_tasks:
-                await insert_queue.put(None)
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
-
-    #TODO: Review this redundant logic (maybe replace with asyncio.TaskGroup())
-    if running_person_api:
-        await asyncio.gather(*running_person_api, return_exceptions=True)
+            
+            # Wait for all Person API batches to be processed
+            await person_api_batch_queue.join()
+            
+            # Signal Person API workers to stop
+            for _ in person_api_workers:
+                await person_api_batch_queue.put(None)
+            await asyncio.gather(*person_api_workers, return_exceptions=True)
+            
+            # Now wait for all insert tasks to complete
+            logger.info(f"Waiting for {len(insert_tasks)} insert tasks to complete...")
+            await asyncio.gather(*insert_tasks, return_exceptions=True)
+            logger.info("All insert tasks completed.")
 
     metrics["done"] = True
     await heartbeat
