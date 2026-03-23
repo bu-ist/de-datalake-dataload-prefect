@@ -10,38 +10,44 @@ from prefect.cache_policies import NONE as NO_CACHE
 from prefect.logging import get_run_logger
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy import text
-from config.resources import PostgresResource, PsQueryResource, ps_url
+from config.resources import PostgresResource, CsToolsResource
 
 
-@task(name="fetch-terms-from-peoplesoft", retries=2, retry_delay_seconds=30, tags=["fetch-terms"])
-async def fetch_terms_from_peoplesoft_task(ps_query_config: dict) -> List[dict]:
+@task(name="fetch-terms-from-cs-tools", retries=2, retry_delay_seconds=30, tags=["fetch-terms"])
+async def fetch_terms_from_cs_tools_task(cstools_config: dict) -> List[dict]:
     """
-    Fetch term data from PeopleSoft BU_TERM_QRY API.
+    Fetch term data from Campus Solutions Tools BU_TERM_QRY API.
     
     Args:
-        ps_query_config (dict): PeopleSoft query configuration.
+        cstools_config (dict): Campus Solutions Tools API configuration.
         
     Returns:
-        List[dict]: List of term records from PeopleSoft.
+        List[dict]: List of term records from CS Tools.
     """
     logger = get_run_logger()
-    logger.info("📡 Fetching term data from PeopleSoft BU_TERM_QRY...")
+    logger.info("📡 Fetching term data from CS Tools BU_TERM_QRY...")
+    logger.info(f"   Endpoint: {cstools_config['url']}")
     fetch_start = datetime.now()
     
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                ps_url(ps_query_config["csEnv"], "BU_TERM_QRY"),
-                params={"isconnectedquery": "N", "maxrows": 0, "json_resp": "true"},
-                headers=ps_query_config["headers"],
+        async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
+            resp = await client.post(
+                cstools_config["url"],
+                json={"query_name": "BU_TERM_QRY"},
+                headers=cstools_config["headers"],
                 timeout=30,
             )
             resp.raise_for_status()
-            rows = resp.json().get("data", {}).get("query", {}).get("rows", [])
+            rows = resp.json().get("data", [])
         
         fetch_duration = (datetime.now() - fetch_start).total_seconds()
         logger.info(f"✅ Retrieved {len(rows)} term rows in {fetch_duration:.2f}s")
         return rows
+    except httpx.ConnectError as e:
+        logger.error(f"❌ Connection error - unable to reach {cstools_config['url']}")
+        logger.error(f"   Please verify DE_CSTOOLS_ENDPOINT is correctly set in your .env file")
+        logger.error(f"   Error details: {e}")
+        raise
     except httpx.HTTPStatusError as e:
         logger.error(f"❌ HTTP error fetching terms: {e.response.status_code} - {e.response.text}")
         raise
@@ -49,7 +55,7 @@ async def fetch_terms_from_peoplesoft_task(ps_query_config: dict) -> List[dict]:
         logger.error(f"❌ Timeout fetching terms after 30s: {e}")
         raise
     except Exception as e:
-        logger.error(f"❌ Failed BU Term Query request: {type(e).__name__}: {e}")
+        logger.error(f"❌ Failed CS Tools query request: {type(e).__name__}: {e}")
         raise
 
 
@@ -146,18 +152,18 @@ async def insert_term_data_task(records: List[Dict], postgres_engine) -> int:
 """
 @flow(
     name="term-raw-flow",
-    description="Retrieves terms from BU_TERM_QRY and prepares it for insertion into the Postgres database",
+    description="Retrieves terms from BU_TERM_QRY via Campus Solutions Tools API and prepares it for insertion into the Postgres database",
     retries=1,
     retry_delay_seconds=300,
     log_prints=True
 )
 async def term_raw_flow():
     """
-    A Prefect flow that retrieves terms from BU_TERM_QRY
+    A Prefect flow that retrieves terms from BU_TERM_QRY via Campus Solutions Tools API
     and prepares it for insertion into the Postgres database.
 
     Steps:
-    1. Fetch term data from PeopleSoft BU_TERM_QRY API
+    1. Fetch term data from Campus Solutions Tools BU_TERM_QRY API
     2. Transform data into records with JSONB format
     3. Truncate and insert into term_raw.term_data table
     4. Refresh current_term_data view
@@ -166,16 +172,16 @@ async def term_raw_flow():
     flow_start = datetime.now()
 
     logger.info("\n╔══════════════════════════════════════════╗")
-    logger.info("║     TERM_RAW_FLOW STARTING            ║")
+    logger.info("║     TERM_RAW_FLOW STARTING                 ║")
     logger.info("╚══════════════════════════════════════════╝")
 
     # Get resources
     postgres_engine = PostgresResource.get_engine()
-    ps_query_config = PsQueryResource.get_config()
+    cstools_config = CsToolsResource.get_config()
 
-    # Step 1: Fetch term data from PeopleSoft
-    logger.info("\n📡 Step 1: Fetching term data from PeopleSoft...")
-    rows = await fetch_terms_from_peoplesoft_task(ps_query_config)
+    # Step 1: Fetch term data from Campus Solutions Tools
+    logger.info("\n📡 Step 1: Fetching term data from Campus Solutions Tools...")
+    rows = await fetch_terms_from_cs_tools_task(cstools_config)
 
     # Step 2: Transform data into records
     logger.info("\n🔄 Step 2: Transforming term data...")

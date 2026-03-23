@@ -4,9 +4,9 @@ A Prefect workflow orchestration project for managing data lake loading operatio
 
 ## Project Overview
 
-This project handles ETL operations for loading data from various sources (PeopleSoft, Data Engineering API, SnapLogic, VDS, SAP) into a PostgreSQL data lake. It consists of three main flows:
+This project handles ETL operations for loading data from various sources (Campus Solutions Tools, Data Engineering API, SnapLogic, VDS, SAP) into a PostgreSQL data lake. It consists of three main flows:
 
-1. **Term Raw Flow** - Loads term data from PeopleSoft (runs at 1:00 AM ET daily)
+1. **Term Raw Flow** - Loads term data from Campus Solutions Tools (runs at 1:00 AM ET daily)
 2. **Course Raw Flow** - Loads course data from SnapLogic (runs at 2:00 AM ET daily)
 3. **Person Raw Flow** - Loads person data from Data Engineering Person API and multiple sources (runs at 3:00 AM ET daily)
 
@@ -92,11 +92,11 @@ The project uses a three-layer data architecture for all pipelines (Person, Cour
 | `DE_PERSON_API_KEY` | API token for Data Engineering Person API |
 | `CS_ENV`            | Campus Solutions environment (`test`, `prod`, etc.) |
 
-### PeopleSoft APIs
+### Data Engineering Campus Solutions Tools API
 | Variable | Description |
 |----------|-------------|
-| `PEOPLE_SOFT_USER` | Username for PeopleSoft |
-| `PEOPLE_SOFT_PASS` | Password for PeopleSoft |
+| `DE_CSTOOLS_ENDPOINT` | API URL for Data Engineering Campus Solutions Tools |
+| `DE_CSTOOLS_KEY` | API key for Data Engineering Campus Solutions Tools |
 
 ### VDS API
 | Variable | Description |
@@ -147,7 +147,7 @@ cp .env.example .env
 Required environment variables:
 - **PostgreSQL**: `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASS`
 - **Campus Solutions**: `CS_ENV`
-- **PeopleSoft**: `PEOPLE_SOFT_USER`, `PEOPLE_SOFT_PASS`
+- **Data Engineering Campus Solutions Tools**: `DE_CSTOOLS_ENDPOINT`, `DE_CSTOOLS_KEY`
 - **SnapLogic Course API**: `SNAPLOGIC_COURSE_URL`, `SNAPLOGIC_COURSE_KEY`
 - **Data Engineering Person API**: `DE_PERSON_API_URL`, `DE_PERSON_API_KEY`
 - **VDS**: `VDS_URL`, `VDS_USERNAME`, `VDS_PASSWORD`
@@ -243,9 +243,9 @@ prefect deployment run 'person-raw-flow/person-raw-daily'
 
 ### Term Raw Flow
 - **Schedule**: Daily at 1:00 AM ET
-- **Source**: PeopleSoft BU_TERM_QRY
+- **Source**: Campus Solutions Tools BU_TERM_QRY
 - **Target**: `term_raw.term_data` table
-- **Description**: Fetches term data from PeopleSoft, truncates the target table, and inserts new data in JSONB format
+- **Description**: Fetches term data from Campus Solutions Tools, truncates the target table, and inserts new data in JSONB format
 
 ### Course Raw Flow
 - **Schedule**: Daily at 2:00 AM ET
@@ -255,11 +255,11 @@ prefect deployment run 'person-raw-flow/person-raw-daily'
 
 ### Person Raw Flow
 - **Schedule**: Daily at 3:00 AM ET
-- **Sources**: PeopleSoft, SAP, VDS (commented out), Data Engineering Person API
+- **Sources**: Campus Solutions Tools, SAP, VDS (commented out), Data Engineering Person API
 - **Target**: `person_raw.person_data` table
 - **Description**:
-  1. Fetches BUIDs from PeopleSoft and SAP
-  2. Queries PeopleSoft for uidCarTerm data for each BUID
+  1. Fetches BUIDs from Campus Solutions Tools and SAP
+  2. Queries Campus Solutions Tools for uidCarTerm data for each BUID
   3. Batches BUIDs and sends to Data Engineering Person API
   4. Inserts person data with sensitive fields removed
 
@@ -356,7 +356,7 @@ To adjust these values, edit the `AsyncpgPoolResource.get_pool_config()` method 
 The person flow uses semaphores to control concurrency:
 
 ```python
-PSQUERY_SEMAPHORE_LIMIT = 10      # Concurrent PeopleSoft queries
+CSTOOLS_SEMAPHORE_LIMIT = 10      # Concurrent Campus Solutions Tools queries
 SNAPLOGIC_SEMAPHORE_LIMIT = 8     # Concurrent SnapLogic requests
 INSERT_SEMAPHORE_LIMIT = 100      # Concurrent database inserts
 ```

@@ -19,9 +19,9 @@ class Settings(BaseSettings):
     # Campus Solutions Environment
     cs_env: str
 
-    # PeopleSoft API
-    people_soft_user: str
-    people_soft_pass: str
+    # Data Engineering Campus Solutions Tools API
+    de_cstools_endpoint: str
+    de_cstools_key: str
 
     # SnapLogic APIs
     snaplogic_course_url: str

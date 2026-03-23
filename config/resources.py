@@ -132,33 +132,29 @@ class DEPersonApiResource:
             "cs_env": settings.cs_env
         }
 
-#TODO: Replace with https://cstools.api-nonprod.bu.edu/api/v1/queries/execute
-class PsQueryResource:
+class CsToolsResource:
     """
-    Resource for connecting to the PeopleSoft API.
+    Resource for connecting to the Data Engineering Campus Solutions Tools API.
 
     Attributes:
-        csEnv (str): The Campus Solutions environment.
-        username (str): Username for basic authentication.
-        password (str): Password for basic authentication.
+        endpoint (str): The API endpoint URL.
+        api_key (str): API key for authentication.
     """
 
     @staticmethod
     def get_config() -> Dict[str, any]:
         """
-        Get PeopleSoft API configuration.
+        Get Campus Solutions Tools API configuration.
 
         Returns:
-            Dict containing CS environment and headers
+            Dict containing URL and headers
         """
-        auth_string = f"{settings.people_soft_user}:{settings.people_soft_pass}"
-        encoded_auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
-
         return {
-            "csEnv": settings.cs_env,
+            "url": settings.de_cstools_endpoint,
             "headers": {
-                "Authorization": f"Basic {encoded_auth}",
-                "User-Agent": "Mozilla/5.0"
+                "x-api-key": settings.de_cstools_key,
+                "User-Agent": "Mozilla/5.0",
+                "Content-Type": "application/json"
             }
         }
 
@@ -217,20 +213,6 @@ class SAPApiResource:
                 "User-Agent": "Mozilla/5.0"
             }
         }
-
-
-def ps_url(env: str, qry: str) -> str:
-    """
-    Helper function to construct PeopleSoft query URLs.
-
-    Args:
-        env: Campus Solutions environment
-        qry: Query name
-
-    Returns:
-        Full URL for the PeopleSoft query
-    """
-    return f"https://cs{env}.bu.edu/PSIGW/RESTListeningConnector/PSFT_CS/ExecuteQuery.v1/PUBLIC/{qry}/JSON/NONFILE"
 
 
 #TODO: Add "HOUSING_STAGE"."ETL_CURR_HOUSING_IDS"

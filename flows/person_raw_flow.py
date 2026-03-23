@@ -16,40 +16,48 @@ import asyncpg
 from config.resources import (
     AsyncpgPoolResource,
     DEPersonApiResource,
-    PsQueryResource,
+    CsToolsResource,
     VDSApiResource,
-    SAPApiResource,
-    ps_url
+    SAPApiResource
 )
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-@task(name="fetch-buids-from-peoplesoft", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
-async def fetch_buids_from_peoplesoft_task(ps_query_config: dict) -> List[str]:
+@task(name="fetch-buids-from-cs-tools", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
+async def fetch_buids_from_cs_tools_task(cstools_config: dict) -> List[str]:
     """
-    Fetch BUIDs from PeopleSoft BU_PARM_0216_QRY query.
+    Fetch BUIDs from Campus Solutions Tools BU_PARM_0216_QRY query.
     
     Args:
-        ps_query_config (dict): PeopleSoft query configuration.
+        cstools_config (dict): Campus Solutions Tools API configuration.
         
     Returns:
-        List[str]: List of BUIDs retrieved from PeopleSoft.
+        List[str]: List of BUIDs retrieved from CS Tools.
     """
     logger = get_run_logger()
-    async with httpx.AsyncClient() as client:
-        logger.info(f"📡 Fetching BUIDs from PeopleSoft BU_PARM_0216_QRY...")
-        resp = await client.get(
-            ps_url(ps_query_config["csEnv"], "BU_PARM_0216_QRY"), #TODO: params {query_name: BU_PARM_0216_QRY}
-            params={"isconnectedquery": "N", "maxrows": 0, "json_resp": "true"},
-            headers=ps_query_config["headers"],
-            timeout=30,
-        )
-        resp.raise_for_status()
-        rows = resp.json().get("data", {}).get("query", {}).get("rows", [])
-    buids = [row.get("CAMPUS_ID") for row in rows if row.get("CAMPUS_ID")]
-    logger.info(f"✅ Retrieved {len(buids)} BUIDs from PeopleSoft BU_PARM_0216_QRY")
-    return buids
+    logger.info(f"📡 Fetching BUIDs from CS Tools BU_PARM_0216_QRY...")
+    logger.info(f"   Endpoint: {cstools_config['url']}")
+    try:
+        async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
+            resp = await client.post(
+                cstools_config["url"],
+                json={"query_name": "BU_PARM_0216_QRY"},
+                headers=cstools_config["headers"],
+                timeout=30,
+            )
+            resp.raise_for_status()
+            rows = resp.json().get("data", [])
+        buids = [row.get("CAMPUS_ID") for row in rows if row.get("CAMPUS_ID")]
+        logger.info(f"✅ Retrieved {len(buids)} BUIDs from CS Tools BU_PARM_0216_QRY")
+        return buids
+    except httpx.ConnectError as e:
+        logger.error(f"❌ Connection error - unable to reach {cstools_config['url']}")
+        logger.error(f"   Error details: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch BUIDs: {type(e).__name__}: {e}")
+        raise
 
 
 @task(name="fetch-buids-from-sap", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
@@ -80,11 +88,11 @@ async def fetch_buids_from_sap_task(sap_api_config: dict) -> List[str]:
     return buids
 
 
-async def query_ps_single(
+async def query_cs_single(
     buid: str,
-    ps_client: httpx.AsyncClient,
-    ps_query_config: dict,
-    ps_sem: asyncio.Semaphore,
+    cs_client: httpx.AsyncClient,
+    cstools_config: dict,
+    cs_sem: asyncio.Semaphore,
     metrics: dict,
     uidCarTerms: list,
     buids_only: list,
@@ -95,13 +103,13 @@ async def query_ps_single(
     logger
 ) -> Optional[Exception]:
     """
-    Query the PeopleSoft API for all uidCarTerm data associated with a given BUID.
+    Query the Campus Solutions Tools API for all uidCarTerm data associated with a given BUID.
 
     Args:
         buid (str): The unique BUID to fetch data for.
-        ps_client (httpx.AsyncClient): HTTP client for making the API request.
-        ps_query_config (dict): PeopleSoft query configuration.
-        ps_sem (asyncio.Semaphore): Semaphore to limit concurrent PS queries.
+        cs_client (httpx.AsyncClient): HTTP client for making the API request.
+        cstools_config (dict): Campus Solutions Tools API configuration.
+        cs_sem (asyncio.Semaphore): Semaphore to limit concurrent CS Tools queries.
         metrics (dict): Shared metrics dictionary.
         uidCarTerms (list): Shared list to append term data.
         buids_only (list): Shared list to append BUIDs without term data.
@@ -114,23 +122,31 @@ async def query_ps_single(
     Returns:
         Optional[Exception]: Returns an exception if all retries fail, else None.
     """
-    async with ps_sem:
-        metrics["ps_queried"] += 1
+    async with cs_sem:
+        metrics["cs_queried"] += 1
         for attempt in range(1, 6):  # 5 retries
             try:
-                req = {"isconnectedquery": "N", "maxrows": 0, "prompt_uniquepromptname": "BUID", "prompt_fieldvalue": buid, "json_resp": "true"}
-                resp = await ps_client.get(ps_url(ps_query_config["csEnv"], "BU_TERM_STD_FULL_TERM"), params=req, timeout=30)
+                payload = {
+                    "query_name": "BU_TERM_STD_FULL_TERM",
+                    "prompt_names": ["BUID"],
+                    "prompt_values": [buid]
+                }
+                resp = await cs_client.post(cstools_config["url"], json=payload, headers=cstools_config["headers"], timeout=30)
                 resp.raise_for_status()
-                uidCarTerm = resp.json()['data']['query']['rows']
+                uidCarTerm = resp.json().get('data', [])
 
                 #TODO: Add logic for Faculty Terms. Consider if buid is a student and faculty for Terms
-                # req = {"isconnectedquery": "N", "maxrows": 0, "prompt_uniquepromptname": "EMPLID", "prompt_fieldvalue": buid, "json_resp": "true"}
-                # resp = await ps_client.get(ps_url(ps_query_config["csEnv"], "BU_FACULTY_GET"), params=req, timeout=30)
+                # payload = {
+                #     "query_name": "BU_FACULTY_GET",
+                #     "prompt_names": ["EMPLID"],
+                #     "prompt_values": [buid]
+                # }
+                # resp = await cs_client.post(cstools_config["url"], json=payload, headers=cstools_config["headers"], timeout=30)
                 # resp.raise_for_status()
-                # facultyTerms = resp.json()['data']['query']['rows']
+                # facultyTerms = resp.json().get('data', [])
 
                 if uidCarTerm:
-                    metrics["ps_success"] += 1
+                    metrics["cs_success"] += 1
                     metrics["uidcarterm_total"] += len(uidCarTerm)
                     # Track unique students (BUIDs with term data)
                     unique_buids_in_terms = set(term.get("CAMPUS_ID") for term in uidCarTerm if term.get("CAMPUS_ID"))
@@ -139,7 +155,7 @@ async def query_ps_single(
                     if len([item for row in uidCarTerms for item in row]) >= UIDCARTERM_BATCH_SIZE:
                         uidCarTerms_threshold_event.set()
                 else:
-                    metrics["ps_empty"] += 1
+                    metrics["cs_empty"] += 1
                     metrics["buids_only_count"] += 1
                     buids_only.append(buid)
                     if len(buids_only) >= BUID_BATCH_SIZE:
@@ -149,17 +165,17 @@ async def query_ps_single(
                 if attempt < 5:
                     await asyncio.sleep(10 * 3 ** (attempt - 1))
                 else:
-                    metrics["errors"]["ps"] += 1
-                    logger.error(f"❌ PSQuery failed for BUID {buid} after {attempt} attempts: {type(e).__name__}: {e}")
+                    metrics["errors"]["cs"] += 1
+                    logger.error(f"❌ CS Tools query failed for BUID {buid} after {attempt} attempts: {type(e).__name__}: {e}")
                     return e
 
 
-@task(name="query-all-buids-from-peoplesoft", retries=1, retry_delay_seconds=30, cache_policy=NO_CACHE, tags=["query-buid-terms"])
+@task(name="query-all-buids-from-cs-tools", retries=1, retry_delay_seconds=30, cache_policy=NO_CACHE, tags=["query-buid-terms"])
 async def query_all_buids_task(
     buids: List[str],
-    ps_client: httpx.AsyncClient,
-    ps_query_config: dict,
-    ps_sem: asyncio.Semaphore,
+    cs_client: httpx.AsyncClient,
+    cstools_config: dict,
+    cs_sem: asyncio.Semaphore,
     metrics: dict,
     uidCarTerms: list,
     buids_only: list,
@@ -169,13 +185,13 @@ async def query_all_buids_task(
     BUID_BATCH_SIZE: int
 ) -> None:
     """
-    Query PeopleSoft for all BUIDs concurrently, respecting semaphore limits.
+    Query Campus Solutions Tools API for all BUIDs concurrently, respecting semaphore limits.
 
     Args:
         buids (List[str]): List of all BUIDs to query.
-        ps_client (httpx.AsyncClient): HTTP client for making the API request.
-        ps_query_config (dict): PeopleSoft query configuration.
-        ps_sem (asyncio.Semaphore): Semaphore to limit concurrent PS queries.
+        cs_client (httpx.AsyncClient): HTTP client for making the API request.
+        cstools_config (dict): Campus Solutions Tools API configuration.
+        cs_sem (asyncio.Semaphore): Semaphore to limit concurrent CS Tools queries.
         metrics (dict): Shared metrics dictionary.
         uidCarTerms (list): Shared list to append term data.
         buids_only (list): Shared list to append BUIDs without term data.
@@ -185,13 +201,13 @@ async def query_all_buids_task(
         BUID_BATCH_SIZE (int): Batch size for BUIDs only.
     """
     logger = get_run_logger()
-    logger.info(f"⏳ Starting PeopleSoft queries for {len(buids)} BUIDs...")
+    logger.info(f"⏳ Starting CS Tools queries for {len(buids)} BUIDs...")
     await asyncio.gather(
-        *(query_ps_single(
+        *(query_cs_single(
             buid=buid,
-            ps_client=ps_client,
-            ps_query_config=ps_query_config,
-            ps_sem=ps_sem,
+            cs_client=cs_client,
+            cstools_config=cstools_config,
+            cs_sem=cs_sem,
             metrics=metrics,
             uidCarTerms=uidCarTerms,
             buids_only=buids_only,
@@ -203,7 +219,7 @@ async def query_all_buids_task(
         ) for buid in buids),
         return_exceptions=True
     )
-    logger.info(f"✅ Completed PeopleSoft queries: {metrics['ps_success']} successful, {metrics['ps_empty']} empty, {metrics['errors']['ps']} errors")
+    logger.info(f"✅ Completed CS Tools queries: {metrics['cs_success']} successful, {metrics['cs_empty']} empty, {metrics['errors']['cs']} errors")
 
 
 @task(
@@ -446,7 +462,7 @@ async def insert_persons_batch_task(
 
     steps:
     1. Extract BUIDs.
-    2. For each BUID, query PeopleSoft to get uidCarTerm data.
+    2. For each BUID, query Campus Solutions Tools API to get uidCarTerm data.
     3. Batch uidCarTerm data and send to Data Engineering Person API to get person details.
     4. Insert person data in the Postgres database.
 """
@@ -463,8 +479,8 @@ async def person_raw_flow():
     and prepares it for insertion into the Postgres database.
 
     Steps:
-    1. Extract BUIDs from PeopleSoft, VDS, and SAP APIs.
-    2. For each BUID, query PeopleSoft to get uidCarTerm data.
+    1. Extract BUIDs from Campus Solutions Tools, VDS, and SAP APIs.
+    2. For each BUID, query Campus Solutions Tools API to get uidCarTerm data.
     3. Batch uidCarTerm data and send to Data Engineering Person API to get person details.
     4. Insert person data in the Postgres database.
     """
@@ -472,27 +488,27 @@ async def person_raw_flow():
 
     UIDCARTERM_BATCH_SIZE = 600
     BUID_BATCH_SIZE = 100
-    PSQUERY_SEMAPHORE_LIMIT = 10 #10
+    CSTOOLS_SEMAPHORE_LIMIT = 10 #10
     PERSON_API_SEMAPHORE_LIMIT = 5 #8
     INSERT_SEMAPHORE_LIMIT = 100 #25
 
     # Get resource configurations
     asyncpg_pool_config = AsyncpgPoolResource.get_pool_config()
     person_api_config = DEPersonApiResource.get_config()
-    ps_query_config = PsQueryResource.get_config()
+    cstools_config = CsToolsResource.get_config()
     vds_api_config = VDSApiResource.get_config()
     sap_api_config = SAPApiResource.get_config()
 
     asyncpg_pool = await asyncpg.create_pool(**asyncpg_pool_config)
 
     metrics = {
-        "ps_queried": 0, "ps_success": 0, "ps_empty": 0,
+        "cs_queried": 0, "cs_success": 0, "cs_empty": 0,
         "students_unique": 0, "uidcarterm_total": 0, "uidcarterm_estimated": 0,
         "buids_only_count": 0, "buids_only_estimated": 0,
         "uidcarterm_batches_sent": 0, "uidcarterm_batches_completed": 0,
         "buid_batches_sent": 0, "buid_batches_completed": 0,
         "persons_received": 0, "insert_success": 0, "insert_skipped": 0,
-        "errors": {"ps": 0, "person_api": 0, "db": 0},
+        "errors": {"cs": 0, "person_api": 0, "db": 0},
         "start_time": datetime.now(), "done": False
     }
 
@@ -501,10 +517,10 @@ async def person_raw_flow():
     # Fetch BUIDs from BU_PARM_0216_QRY query
     logger.info("\n📡 Step 1: Fetching BUIDs from data sources...")
     try:
-        ps_buids_task = await fetch_buids_from_peoplesoft_task(ps_query_config)
-        buids.extend(ps_buids_task)
+        cs_buids_task = await fetch_buids_from_cs_tools_task(cstools_config)
+        buids.extend(cs_buids_task)
     except Exception as e:
-        logger.error(f"❌ Failed to fetch BUIDs from PeopleSoft BU_PARM_0216_QRY: {type(e).__name__}: {e}")
+        logger.error(f"❌ Failed to fetch BUIDs from CS Tools BU_PARM_0216_QRY: {type(e).__name__}: {e}")
         raise
 
     # TODO: Fetch ENS population Too, or call EVERY Population.
@@ -541,12 +557,12 @@ async def person_raw_flow():
 
     #TODO: Any failed BUIDs will go into the person_live_update queue for reprocessing
 
-    ps_sem = asyncio.Semaphore(PSQUERY_SEMAPHORE_LIMIT)
+    cs_sem = asyncio.Semaphore(CSTOOLS_SEMAPHORE_LIMIT)
     person_api_sem = asyncio.Semaphore(PERSON_API_SEMAPHORE_LIMIT)
     insert_sem = asyncio.Semaphore(INSERT_SEMAPHORE_LIMIT)
 
     uidCarTerms, buids_only = [], []
-    uidCarTerms_threshold_event, buids_threshold_event, all_ps_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    uidCarTerms_threshold_event, buids_threshold_event, all_cs_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
     # Queue for batches waiting to be processed by Person API
     person_api_batch_queue: asyncio.Queue = asyncio.Queue()
     
@@ -637,17 +653,17 @@ async def person_raw_flow():
         try:
             while not metrics["done"]:
                 elapsed = (datetime.now() - start).total_seconds()
-                ps_done = metrics["ps_queried"]
-                progress = ps_done / total_buids if total_buids else 0
+                cs_done = metrics["cs_queried"]
+                progress = cs_done / total_buids if total_buids else 0
                 total_estimated_runtime = None
                 
                 # Calculate estimates and ETA
                 total_batches_completed = metrics["uidcarterm_batches_completed"] + metrics["buid_batches_completed"]
                 if total_batches_completed > 0:
                     # Estimate total batches needed
-                    if ps_done > 0:
-                        avg_terms_per_student = metrics["uidcarterm_total"] / metrics["ps_success"] if metrics["ps_success"] > 0 else 0
-                        est_total_terms = int(avg_terms_per_student * metrics["ps_success"] + (total_buids - ps_done) * avg_terms_per_student)
+                    if cs_done > 0:
+                        avg_terms_per_student = metrics["uidcarterm_total"] / metrics["cs_success"] if metrics["cs_success"] > 0 else 0
+                        est_total_terms = int(avg_terms_per_student * metrics["cs_success"] + (total_buids - cs_done) * avg_terms_per_student)
                         est_term_batches = math.ceil(est_total_terms / UIDCARTERM_BATCH_SIZE)
                         est_buid_batches = math.ceil((total_buids - metrics["students_unique"]) / BUID_BATCH_SIZE)
                         est_batches_total = est_term_batches + est_buid_batches
@@ -678,19 +694,20 @@ async def person_raw_flow():
                 batch_queue_size = person_api_batch_queue.qsize()
                 
                 # Calculate estimated totals
-                if ps_done > 0:
-                    avg_terms = metrics["uidcarterm_total"] / metrics["ps_success"] if metrics["ps_success"] > 0 else 0
+                cs_done = metrics["cs_queried"]
+                if cs_done > 0:
+                    avg_terms = metrics["uidcarterm_total"] / metrics["cs_success"] if metrics["cs_success"] > 0 else 0
                     metrics["uidcarterm_estimated"] = int(avg_terms * total_buids)
-                    metrics["buids_only_estimated"] = total_buids - metrics["students_unique"] if ps_done >= total_buids else int((metrics["ps_empty"] / ps_done) * total_buids)
+                    metrics["buids_only_estimated"] = total_buids - metrics["students_unique"] if cs_done >= total_buids else int((metrics["cs_empty"] / cs_done) * total_buids)
                     
                     # Calculate estimated batch counts for display
-                    avg_terms_per_student = metrics["uidcarterm_total"] / metrics["ps_success"] if metrics["ps_success"] > 0 else 0
-                    remaining_buids = total_buids - ps_done
-                    frac_with_terms = metrics["ps_success"] / ps_done
+                    avg_terms_per_student = metrics["uidcarterm_total"] / metrics["cs_success"] if metrics["cs_success"] > 0 else 0
+                    remaining_buids = total_buids - cs_done
+                    frac_with_terms = metrics["cs_success"] / cs_done
                     est_remaining_terms = int(remaining_buids * frac_with_terms * avg_terms_per_student)
                     est_total_terms = metrics["uidcarterm_total"] + est_remaining_terms
                     est_term_batches = math.ceil(est_total_terms / UIDCARTERM_BATCH_SIZE) if est_total_terms > 0 else 0
-                    est_total_buids_without_terms = int((metrics["ps_empty"] / ps_done) * total_buids)
+                    est_total_buids_without_terms = int((metrics["cs_empty"] / cs_done) * total_buids)
                     est_buid_batches = math.ceil(est_total_buids_without_terms / BUID_BATCH_SIZE) if est_total_buids_without_terms > 0 else 0
                     est_batches_total = est_term_batches + est_buid_batches
                 else:
@@ -701,7 +718,7 @@ async def person_raw_flow():
                 # Format totals for batches
                 total_batches_sent = metrics["uidcarterm_batches_sent"] + metrics["buid_batches_sent"]
                 total_batches_completed = metrics["uidcarterm_batches_completed"] + metrics["buid_batches_completed"]
-                ps_active = PSQUERY_SEMAPHORE_LIMIT - ps_sem._value
+                cs_active = CSTOOLS_SEMAPHORE_LIMIT - cs_sem._value
                 person_api_active = PERSON_API_SEMAPHORE_LIMIT - person_api_sem._value
                 insert_active = INSERT_SEMAPHORE_LIMIT - insert_sem._value
                 logger.info(
@@ -709,9 +726,9 @@ async def person_raw_flow():
                     f"\n║ HEARTBEAT [{elapsed_str}] — ETA: {eta_str}               "
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ DATA COLLECTION                                                   "
-                    f"\n║   PS Queries:         {ps_done:>6,} / {total_buids:<6,} ({progress*100:>5.1f}%)              "
-                    f"\n║     └─ With Terms:    {metrics['ps_success']:>6,} students → {metrics['uidcarterm_total']:>6,} term records   "
-                    f"\n║     └─ Without Terms: {metrics['ps_empty']:>6,} people (BUID only)               "
+                    f"\n║   CS Tools Queries: {cs_done:>6,} / {total_buids:<6,} ({progress*100:>5.1f}%)              "
+                    f"\n║     └─ With Terms:    {metrics['cs_success']:>6,} students → {metrics['uidcarterm_total']:>6,} term records   "
+                    f"\n║     └─ Without Terms: {metrics['cs_empty']:>6,} people (BUID only)               "
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ API BATCHES (Person API)                                          "
                     f"\n║   Student Batches:    {metrics['uidcarterm_batches_completed']:>3} / {est_term_batches:<3} completed                "
@@ -725,8 +742,8 @@ async def person_raw_flow():
                     f"\n║   Skipped:            {metrics['insert_skipped']:>6,} records                            "
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ RESOURCE USAGE                                                    "
-                    f"\n║   Semaphores Active:  PS={ps_active}/{PSQUERY_SEMAPHORE_LIMIT}  API={person_api_active}/{PERSON_API_SEMAPHORE_LIMIT}  Insert={insert_active}/{INSERT_SEMAPHORE_LIMIT}     "
-                    f"\n║   Errors:             PS={metrics['errors']['ps']}  API={metrics['errors']['person_api']}  DB={metrics['errors']['db']}                  "
+                    f"\n║   Semaphores Active:  CS={cs_active}/{CSTOOLS_SEMAPHORE_LIMIT}  API={person_api_active}/{PERSON_API_SEMAPHORE_LIMIT}  Insert={insert_active}/{INSERT_SEMAPHORE_LIMIT}     "
+                    f"\n║   Errors:             CS={metrics['errors']['cs']}  API={metrics['errors']['person_api']}  DB={metrics['errors']['db']}                  "
                     f"\n╚═══════════════════════════════════════════════════════════════════╝"
                 )
                 await asyncio.sleep(interval)
@@ -736,7 +753,7 @@ async def person_raw_flow():
     async def monitor_uidCarTerms(person_api_client: httpx.AsyncClient) -> None:
         """
         Monitor and submit uidCarTerm data batches to Data Engineering Person API as they become ready,
-        waiting for either uidCarTerms_threshold_event or buids_threshold_event or the completion of PS queries.
+        waiting for either uidCarTerms_threshold_event or buids_threshold_event or the completion of CS Tools queries.
 
         Args:
             person_api_client (httpx.AsyncClient): HTTP client for Person API requests.
@@ -746,7 +763,7 @@ async def person_raw_flow():
         """
         while True:
             done, _ = await asyncio.wait(
-                [asyncio.create_task(uidCarTerms_threshold_event.wait()), asyncio.create_task(buids_threshold_event.wait()), asyncio.create_task(all_ps_done.wait())],
+                [asyncio.create_task(uidCarTerms_threshold_event.wait()), asyncio.create_task(buids_threshold_event.wait()), asyncio.create_task(all_cs_done.wait())],
                 return_when=asyncio.FIRST_COMPLETED)
             if uidCarTerms_threshold_event.is_set():
                 uidCarTerms_threshold_event.clear()
@@ -760,8 +777,8 @@ async def person_raw_flow():
                 if snapshot:
                     batch_counter["buids"] += 1
                     await person_api_batch_queue.put(("buids", snapshot, batch_counter["buids"]))
-            if all_ps_done.is_set():
-                #TODO: run uidcarterms evenly across all semaphores if psqueries are small. Will be important once we implement live updates
+            if all_cs_done.is_set():
+                #TODO: run uidcarterms evenly across all semaphores if cstools queries are small. Will be important once we implement live updates
                 if uidCarTerms:
                     snapshot = uidCarTerms.copy(); uidCarTerms.clear()
                     batch_counter["uidcarterms"] += 1
@@ -778,14 +795,14 @@ async def person_raw_flow():
         # Start Person API workers (only PERSON_API_SEMAPHORE_LIMIT will run concurrently)
         person_api_workers = [asyncio.create_task(person_api_worker(person_api_client)) for _ in range(PERSON_API_SEMAPHORE_LIMIT)]
         
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True, headers=ps_query_config["headers"]) as ps_client:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True, verify=False, headers=cstools_config["headers"]) as cs_client:
             monitor_task = asyncio.create_task(monitor_uidCarTerms(person_api_client))
-            # Query all BUIDs from PeopleSoft as a single task
+            # Query all BUIDs from Campus Solutions Tools as a single task
             await query_all_buids_task(
                 buids=buids,
-                ps_client=ps_client,
-                ps_query_config=ps_query_config,
-                ps_sem=ps_sem,
+                cs_client=cs_client,
+                cstools_config=cstools_config,
+                cs_sem=cs_sem,
                 metrics=metrics,
                 uidCarTerms=uidCarTerms,
                 buids_only=buids_only,
@@ -794,7 +811,7 @@ async def person_raw_flow():
                 UIDCARTERM_BATCH_SIZE=UIDCARTERM_BATCH_SIZE,
                 BUID_BATCH_SIZE=BUID_BATCH_SIZE
             )
-            all_ps_done.set()
+            all_cs_done.set()
             await monitor_task
             
             # Wait for all Person API batches to be processed
@@ -837,7 +854,7 @@ async def person_raw_flow():
     logger.info(f"║ Records Inserted:          {metrics['insert_success']:>6,}                     ║")
     logger.info(f"║ Records Skipped:           {metrics['insert_skipped']:>6,}                     ║")
     logger.info("╠═══════════════════════════════════════════════════════╣")
-    logger.info(f"║ Errors: PS={metrics['errors']['ps']}  API={metrics['errors']['person_api']}  DB={metrics['errors']['db']}                        ║")
+    logger.info(f"║ Errors: CS={metrics['errors']['cs']}  API={metrics['errors']['person_api']}  DB={metrics['errors']['db']}                        ║")
     logger.info(f"║ Duration: {int(elapsed//3600)}h {int((elapsed%3600)//60)}m {int(elapsed%60)}s                              ║")
     logger.info("╚═══════════════════════════════════════════════════════╝")
 
