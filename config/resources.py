@@ -132,7 +132,7 @@ class DEPersonApiResource:
             "cs_env": settings.cs_env
         }
 
-
+#TODO: Replace with https://cstools.api-nonprod.bu.edu/api/v1/queries/execute
 class PsQueryResource:
     """
     Resource for connecting to the PeopleSoft API.

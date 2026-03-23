@@ -38,8 +38,9 @@ async def fetch_buids_from_peoplesoft_task(ps_query_config: dict) -> List[str]:
     """
     logger = get_run_logger()
     async with httpx.AsyncClient() as client:
+        logger.info(f"📡 Fetching BUIDs from PeopleSoft BU_PARM_0216_QRY...")
         resp = await client.get(
-            ps_url(ps_query_config["csEnv"], "BU_PARM_0216_QRY"),
+            ps_url(ps_query_config["csEnv"], "BU_PARM_0216_QRY"), #TODO: params {query_name: BU_PARM_0216_QRY}
             params={"isconnectedquery": "N", "maxrows": 0, "json_resp": "true"},
             headers=ps_query_config["headers"],
             timeout=30,
@@ -47,7 +48,7 @@ async def fetch_buids_from_peoplesoft_task(ps_query_config: dict) -> List[str]:
         resp.raise_for_status()
         rows = resp.json().get("data", {}).get("query", {}).get("rows", [])
     buids = [row.get("CAMPUS_ID") for row in rows if row.get("CAMPUS_ID")]
-    logger.info(f"Retrieved {len(buids)} BUIDs from BU_PARM_0216_QRY.")
+    logger.info(f"✅ Retrieved {len(buids)} BUIDs from PeopleSoft BU_PARM_0216_QRY")
     return buids
 
 
@@ -63,6 +64,7 @@ async def fetch_buids_from_sap_task(sap_api_config: dict) -> List[str]:
         List[str]: List of active employee BUIDs from SAP.
     """
     logger = get_run_logger()
+    logger.info(f"📡 Fetching active employee BUIDs from SAP Z_HR_EMPLOYEE_OBJ_LIST...")
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             sap_api_config["url"],
@@ -74,7 +76,7 @@ async def fetch_buids_from_sap_task(sap_api_config: dict) -> List[str]:
         resp.raise_for_status()
         rows = resp.json().get("ET_EMP_LIST", [])
     buids = [row.get("BUID") for row in rows if row.get("EMP_STATUS") == "3 - Active" and row.get("BUID")]
-    logger.info(f"Retrieved {len(buids)} BUIDs from SAP Z_HR_EMPLOYEE_OBJ_LIST.")
+    logger.info(f"✅ Retrieved {len(buids)} active employee BUIDs from SAP")
     return buids
 
 
@@ -148,7 +150,7 @@ async def query_ps_single(
                     await asyncio.sleep(10 * 3 ** (attempt - 1))
                 else:
                     metrics["errors"]["ps"] += 1
-                    logger.error(f"PSQuery error for BUID {buid}: {e}")
+                    logger.error(f"❌ PSQuery failed for BUID {buid} after {attempt} attempts: {type(e).__name__}: {e}")
                     return e
 
 
@@ -183,7 +185,7 @@ async def query_all_buids_task(
         BUID_BATCH_SIZE (int): Batch size for BUIDs only.
     """
     logger = get_run_logger()
-    logger.info(f"Querying PeopleSoft for {len(buids)} BUIDs...")
+    logger.info(f"⏳ Starting PeopleSoft queries for {len(buids)} BUIDs...")
     await asyncio.gather(
         *(query_ps_single(
             buid=buid,
@@ -201,7 +203,7 @@ async def query_all_buids_task(
         ) for buid in buids),
         return_exceptions=True
     )
-    logger.info(f"Completed querying {len(buids)} BUIDs from PeopleSoft")
+    logger.info(f"✅ Completed PeopleSoft queries: {metrics['ps_success']} successful, {metrics['ps_empty']} empty, {metrics['errors']['ps']} errors")
 
 
 @task(
@@ -237,7 +239,7 @@ async def process_uidCarTerms_batch_task(
     logger = get_run_logger()
     flattened = [item for row in batch for item in row]
     if not flattened:
-        logger.info("📦 Empty batch - skipping")
+        logger.info(f"📦 Batch {batch_id}: Empty batch - skipping")
         return []
     
     # Extract unique BUIDs and count terms
@@ -245,7 +247,7 @@ async def process_uidCarTerms_batch_task(
     num_terms = len(flattened)
     num_students = len(unique_buids)
     
-    logger.info(f"📦 Processing batch {batch_id}: {num_students} students, {num_terms} term records")
+    logger.info(f"📦 Batch {batch_id} [Students]: Processing {num_students} students with {num_terms} term records")
     
     # Convert to API format: lowercase keys and rename CAMPUS_ID to buid
     uid_car_term_data = [
@@ -259,20 +261,22 @@ async def process_uidCarTerms_batch_task(
     
     async with person_api_sem:
         metrics["uidcarterm_batches_sent"] += 1
+        api_start = datetime.now()
         #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
         resp = await person_api_client.post(
             person_api_config["url"],
             json=payload,
-            timeout=10000
+            timeout=1200
         )
         resp.raise_for_status()
+        api_duration = (datetime.now() - api_start).total_seconds()
         response_obj = resp.json()
         persons = response_obj.get("data", [])
         persons = [p for p in persons if p.get("personid")]
         metrics["persons_received"] += len(persons)
         metrics["uidcarterm_batches_completed"] += 1
         
-        logger.info(f"✅ Batch {batch_id} complete: Retrieved {len(persons)} person records from {num_students} students with {num_terms} terms")
+        logger.info(f"✅ Batch {batch_id} [Students]: Retrieved {len(persons)} persons in {api_duration:.1f}s (from {num_students} students, {num_terms} terms)")
         return persons
 
 
@@ -308,11 +312,11 @@ async def process_buids_batch_task(
     """
     logger = get_run_logger()
     if not batch:
-        logger.info("📦 Empty batch - skipping")
+        logger.info(f"📦 Batch {batch_id}: Empty batch - skipping")
         return []
     
     num_buids = len(batch)
-    logger.info(f"📦 Processing batch {batch_id}: {num_buids} BUIDs (no term data)")
+    logger.info(f"📦 Batch {batch_id} [BUIDs]: Processing {num_buids} BUIDs (no term data)")
     
     payload = {
         "buids": batch,
@@ -321,6 +325,7 @@ async def process_buids_batch_task(
     
     async with person_api_sem:
         metrics["buid_batches_sent"] += 1
+        api_start = datetime.now()
         #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
         resp = await person_api_client.post(
             person_api_config["url"],
@@ -328,13 +333,14 @@ async def process_buids_batch_task(
             timeout=10000
         )
         resp.raise_for_status()
+        api_duration = (datetime.now() - api_start).total_seconds()
         response_obj = resp.json()
         persons = response_obj.get("data", [])
         persons = [p for p in persons if p.get("personid")]
         metrics["persons_received"] += len(persons)
         metrics["buid_batches_completed"] += 1
         
-        logger.info(f"✅ Batch {batch_id} complete: Retrieved {len(persons)} person records from {num_buids} BUIDs")
+        logger.info(f"✅ Batch {batch_id} [BUIDs]: Retrieved {len(persons)} persons in {api_duration:.1f}s (from {num_buids} BUIDs)")
         return persons
 
 
@@ -374,12 +380,14 @@ async def insert_persons_batch_task(
     error_count = 0
     
     num_persons = len(persons)
-    logger.info(f"💾 Starting insert for batch {batch_id} ({batch_type}): {num_persons} person records")
+    logger.info(f"💾 Starting insert batch {batch_id} [{batch_type}]: {num_persons} person records")
+    insert_batch_start = datetime.now()
     
     for p in persons:
         uid = p.get("personid")
         if not uid:
             skipped_count += 1
+            logger.warning(f"⚠️  Batch {batch_id}: Skipping record without personid")
             continue
 
         # Safely remove sensitive fields if the parent objects exist and are dicts
@@ -408,16 +416,18 @@ async def insert_persons_batch_task(
         except Exception as e:
             metrics["errors"]["db"] += 1
             error_count += 1
-            logger.error(f"❌ Insert failed for person {uid}: {e}")
+            logger.error(f"❌ Batch {batch_id}: Insert failed for person {uid}: {type(e).__name__}: {e}")
     
     metrics["insert_success"] += inserted_count
     metrics["insert_skipped"] += skipped_count
     
+    insert_batch_duration = (datetime.now() - insert_batch_start).total_seconds()
+    
     # Log summary for this insert batch
     if error_count > 0:
-        logger.warning(f"⚠️ Insert batch {batch_id} ({batch_type}): {inserted_count} inserted, {skipped_count} skipped, {error_count} errors")
+        logger.warning(f"⚠️  Insert batch {batch_id} [{batch_type}]: {inserted_count} inserted, {skipped_count} skipped, {error_count} errors ({insert_batch_duration:.2f}s)")
     else:
-        logger.info(f"✅ Insert batch {batch_id} ({batch_type}) complete: {inserted_count} inserted, {skipped_count} skipped")
+        logger.info(f"✅ Insert batch {batch_id} [{batch_type}]: {inserted_count} inserted, {skipped_count} skipped ({insert_batch_duration:.2f}s, {inserted_count/insert_batch_duration:.1f} rec/s)")
     
     return {
         "batch_id": batch_id,
@@ -425,7 +435,8 @@ async def insert_persons_batch_task(
         "inserted": inserted_count,
         "skipped": skipped_count,
         "errors": error_count,
-        "total_attempted": num_persons
+        "total_attempted": num_persons,
+        "duration_seconds": insert_batch_duration
     }
 
 
@@ -459,8 +470,8 @@ async def person_raw_flow():
     """
     logger = get_run_logger()
 
-    UIDCARTERM_BATCH_SIZE = 6000
-    BUID_BATCH_SIZE = 1000
+    UIDCARTERM_BATCH_SIZE = 600
+    BUID_BATCH_SIZE = 100
     PSQUERY_SEMAPHORE_LIMIT = 10 #10
     PERSON_API_SEMAPHORE_LIMIT = 5 #8
     INSERT_SEMAPHORE_LIMIT = 100 #25
@@ -488,11 +499,12 @@ async def person_raw_flow():
     buids = []
 
     # Fetch BUIDs from BU_PARM_0216_QRY query
+    logger.info("\n📡 Step 1: Fetching BUIDs from data sources...")
     try:
         ps_buids_task = await fetch_buids_from_peoplesoft_task(ps_query_config)
         buids.extend(ps_buids_task)
     except Exception as e:
-        logger.error(f"Failed to fetch BUIDs from PeopleSoft BU_PARM_0216_QRY: {e}")
+        logger.error(f"❌ Failed to fetch BUIDs from PeopleSoft BU_PARM_0216_QRY: {type(e).__name__}: {e}")
         raise
 
     # TODO: Fetch ENS population Too, or call EVERY Population.
@@ -521,11 +533,11 @@ async def person_raw_flow():
         sap_buids_task = await fetch_buids_from_sap_task(sap_api_config)
         buids.extend(sap_buids_task)
     except Exception as e:
-        logger.error(f"Failed to fetch BUIDs from SAP: {e}")
+        logger.error(f"❌ Failed to fetch BUIDs from SAP: {type(e).__name__}: {e}")
         raise
 
     buids = list(set(buids))  # Deduplicate BUIDs
-    logger.info(f"Total unique BUIDs to process: {len(buids)}")
+    logger.info(f"\n✅ Total unique BUIDs to process: {len(buids):,}")
 
     #TODO: Any failed BUIDs will go into the person_live_update queue for reprocessing
 
@@ -568,7 +580,8 @@ async def person_raw_flow():
                         person_api_client=person_api_client,
                         person_api_config=person_api_config,
                         person_api_sem=person_api_sem,
-                        metrics=metrics
+                        metrics=metrics,
+                        wait_for=[]
                     )
                 elif batch_type == "buids":
                     persons = await process_buids_batch_task(
@@ -577,7 +590,8 @@ async def person_raw_flow():
                         person_api_client=person_api_client,
                         person_api_config=person_api_config,
                         person_api_sem=person_api_sem,
-                        metrics=metrics
+                        metrics=metrics,
+                        wait_for=[]
                     )
                 
                 # Create insert task but DON'T await it - this allows the worker
@@ -592,13 +606,14 @@ async def person_raw_flow():
                             batch_type=batch_type,
                             asyncpg_pool=asyncpg_pool,
                             insert_sem=insert_sem,
-                            metrics=metrics
+                            metrics=metrics,
+                            wait_for=[]
                         )
                     )
                     async with insert_tasks_lock:
                         insert_tasks.append(insert_task)
             except Exception as e:
-                logger.error(f"Worker error processing {batch_type} batch {batch_id}: {e}")
+                logger.error(f"Worker error processing {batch_type} batch {batch_id}: {type(e).__name__}: {e}")
                 metrics["errors"]["person_api"] += 1
             finally:
                 person_api_batch_queue.task_done()
@@ -791,9 +806,11 @@ async def person_raw_flow():
             await asyncio.gather(*person_api_workers, return_exceptions=True)
             
             # Now wait for all insert tasks to complete
-            logger.info(f"Waiting for {len(insert_tasks)} insert tasks to complete...")
+            logger.info(f"\n⏳ Waiting for {len(insert_tasks)} insert tasks to complete...")
+            insert_wait_start = datetime.now()
             await asyncio.gather(*insert_tasks, return_exceptions=True)
-            logger.info("All insert tasks completed.")
+            insert_wait_duration = (datetime.now() - insert_wait_start).total_seconds()
+            logger.info(f"✅ All insert tasks completed in {insert_wait_duration:.2f}s")
 
     metrics["done"] = True
     await heartbeat
