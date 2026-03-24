@@ -1,18 +1,7 @@
-"""
-Deployment configuration for term_raw_flow.
-Scheduled to run at 1:00 AM ET daily.
-
-Resource Requirements:
-- CPU Request: 1000m (1 core)
-- CPU Limit: 2000m (2 cores)
-- Memory Request: 2Gi
-- Memory Limit: 3Gi
-"""
 from prefect.deployments import Deployment
 from prefect.server.schemas.schedules import CronSchedule
-from flows.term_raw_flow import term_raw_flow
+from flows.term.term_flow import term_raw_flow
 
-# Create schedules: 1am term, 2am course, 3am person (ET)
 deployment = Deployment.build_from_flow(
     flow=term_raw_flow,
     name="term-raw-daily",
