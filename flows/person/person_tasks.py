@@ -158,22 +158,39 @@ async def process_uidCarTerms_batch_task(
     num_terms = len(flattened)
     num_students = len(unique_buids)
 
-    logger.info(f"📦 Batch {batch_id} [Students]: {num_students} students, {num_terms} terms — [{', '.join(sorted(unique_buids))}]")
-
+    buid_car_terms: dict = {}
+    for item in flattened:
+        buid = item.get("CAMPUS_ID", "?")
+        career = item.get("ACAD_CAREER", "?")
+        term = str(item.get("STRM", "?"))
+        buid_car_terms.setdefault(buid, []).append(f"{{{career}, {term}}}")
+    buid_summary = "\n  ".join(
+        f"{buid}: [{', '.join(pairs)}]"
+        for buid, pairs in sorted(buid_car_terms.items())
+    )
     uid_car_term_data = [
         {("buid" if k=="CAMPUS_ID" else k.lower()): v for k, v in item.items() if k != "attr:rownumber"}
         for item in flattened
     ]
-    payload = {"objects": ["student", "affiliate", "faculty", "employee"], "student": {"uid_car_term": uid_car_term_data}}
+    payload = {"objects": ["student", "affiliate", "faculty", "employee"], "student": {"uid_car_term": uid_car_term_data}, "options": {"response_format": "ndjson", "batch_size": num_terms + 1}}
 
     async with person_api_sem:
         metrics["uidcarterm_batches_sent"] += 1
+        logger.info(f"📦 Batch {batch_id} [Students]: {num_students} BUIDs, {num_terms} terms\n  {buid_summary}")
         api_start = datetime.now()
+        persons = []
         #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
-        resp = await person_api_client.post(person_api_config["url"], json=payload, timeout=1200)
-        resp.raise_for_status()
+        async with person_api_client.stream("POST", person_api_config["url"], json=payload, timeout=1200) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if record.get("type") == "record":
+                    data = record.get("data", {})
+                    if data.get("personid"):
+                        persons.append(data)
         api_duration = (datetime.now() - api_start).total_seconds()
-        persons = [p for p in resp.json().get("data", []) if p.get("personid")]
         metrics["persons_received"] += len(persons)
         metrics["uidcarterm_batches_completed"] += 1
 
@@ -204,16 +221,24 @@ async def process_buids_batch_task(
 
     logger.info(f"📦 Batch {batch_id} [BUIDs]: {len(batch)} BUIDs — [{', '.join(batch)}]")
 
-    payload = {"buids": batch, "objects": ["student", "affiliate", "faculty", "employee"]}
+    payload = {"buids": batch, "objects": ["student", "affiliate", "faculty", "employee"], "options": {"response_format": "ndjson"}}
 
     async with person_api_sem:
         metrics["buid_batches_sent"] += 1
         api_start = datetime.now()
+        persons = []
         #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
-        resp = await person_api_client.post(person_api_config["url"], json=payload, timeout=10000)
-        resp.raise_for_status()
+        async with person_api_client.stream("POST", person_api_config["url"], json=payload, timeout=10000) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if record.get("type") == "record":
+                    data = record.get("data", {})
+                    if data.get("personid"):
+                        persons.append(data)
         api_duration = (datetime.now() - api_start).total_seconds()
-        persons = [p for p in resp.json().get("data", []) if p.get("personid")]
         metrics["persons_received"] += len(persons)
         metrics["buid_batches_completed"] += 1
 
@@ -264,22 +289,37 @@ async def insert_persons_batch_task(
 
         records.append((uid, json.dumps(p)))
 
+    trigger_skipped = 0
+    trigger_skipped_buids: list = []
+    actually_inserted_buids: list = []
     if records:
         try:
             async with insert_sem:
                 async with asyncpg_pool.acquire() as conn:
-                    #TODO: Add to skipped count if person_raw doesn't need to be updated
-                    await conn.executemany("INSERT INTO person_raw.person_data (bu_uid, person_data) VALUES ($1, $2::jsonb)", records)
+                    result = await conn.fetch(
+                        "INSERT INTO person_raw.person_data (bu_uid, person_data) "
+                        "SELECT * FROM unnest($1::text[], $2::jsonb[]) AS t(bu_uid, person_data) "
+                        "RETURNING bu_uid",
+                        [r[0] for r in records],
+                        [r[1] for r in records]
+                    )
+            inserted_buids_set = {row["bu_uid"] for row in result}
+            trigger_skipped_buids = sorted(r[0] for r in records if r[0] not in inserted_buids_set)
+            actually_inserted_buids = sorted(inserted_buids_set)
+            trigger_skipped = len(trigger_skipped_buids)
+            skipped_count += trigger_skipped
         except Exception as e:
             insert_batch_duration = (datetime.now() - insert_batch_start).total_seconds()
             logger.error(f"❌ Batch {batch_id} [{batch_type}]: Insert failed after all retries: {type(e).__name__}: {e} ({insert_batch_duration:.2f}s)")
             raise
 
-    inserted_count = len(records)
+    inserted_count = len(records) - trigger_skipped
     metrics["insert_success"] += inserted_count
     metrics["insert_skipped"] += skipped_count
 
     insert_batch_duration = (datetime.now() - insert_batch_start).total_seconds()
-    logger.info(f"✅ Batch {batch_id} [{batch_type}]: {inserted_count} inserted, {skipped_count} skipped ({insert_batch_duration:.2f}s)")
+    inserted_detail = f"\n  inserted:        [{', '.join(actually_inserted_buids)}]" if actually_inserted_buids else ""
+    skipped_detail = f"\n  skipped (unchanged): [{', '.join(trigger_skipped_buids)}]" if trigger_skipped_buids else ""
+    logger.info(f"✅ Batch {batch_id} [{batch_type}]: {inserted_count} inserted, {skipped_count} skipped ({insert_batch_duration:.2f}s){inserted_detail}{skipped_detail}")
 
     return {"batch_id": batch_id, "batch_type": batch_type, "inserted": inserted_count, "skipped": skipped_count, "duration_seconds": insert_batch_duration}
