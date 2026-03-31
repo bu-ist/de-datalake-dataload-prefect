@@ -1,4 +1,5 @@
 import asyncio
+import math
 import httpx
 from datetime import datetime
 from prefect import flow
@@ -146,6 +147,7 @@ async def person_raw_flow(
     phase_info = {"total_buids": 0}
 
     async def monitor_progress(interval: int = 15) -> None:
+        last_valid_total_runtime = None
         try:
             while not metrics["done"]:
                 elapsed = (datetime.now() - start_time).total_seconds()
@@ -154,9 +156,39 @@ async def person_raw_flow(
                 total_buids_known = phase_info["total_buids"]
                 progress = cs_done / total_buids_known if total_buids_known else 0
                 total_batches_completed = metrics["uidcarterm_batches_completed"] + metrics["buid_batches_completed"]
+
+                if cs_done >= total_buids_known and total_buids_known > 0:
+                    est_term_batches = batch_counter["uidcarterms"]
+                    est_buid_batches = batch_counter["buids"]
+                    est_batches_total = est_term_batches + est_buid_batches
+                elif cs_done > 0:
+                    avg_terms_per_student = metrics["uidcarterm_total"] / metrics["cs_success"] if metrics["cs_success"] > 0 else 0
+                    frac_with_terms = metrics["cs_success"] / cs_done
+                    remaining_buids = total_buids_known - cs_done
+                    est_total_terms = metrics["uidcarterm_total"] + int(remaining_buids * frac_with_terms * avg_terms_per_student)
+                    est_term_batches = math.ceil(est_total_terms / uidcarterm_batch_size) if est_total_terms > 0 else 0
+                    est_total_buids_without_terms = int((metrics["cs_empty"] / cs_done) * total_buids_known)
+                    est_buid_batches = math.ceil(est_total_buids_without_terms / buid_batch_size) if est_total_buids_without_terms > 0 else 0
+                    est_batches_total = est_term_batches + est_buid_batches
+                else:
+                    est_term_batches = 0
+                    est_buid_batches = 0
+                    est_batches_total = 1
+
+                total_estimated_runtime = None
+                if total_batches_completed > 0:
+                    remaining_batches = max(est_batches_total - total_batches_completed, 0)
+                    avg_batch_time = elapsed / max(total_batches_completed, 1)
+                    total_estimated_runtime = elapsed + avg_batch_time * remaining_batches
+                    last_valid_total_runtime = total_estimated_runtime
+
+                if total_estimated_runtime is None and last_valid_total_runtime is not None:
+                    total_estimated_runtime = last_valid_total_runtime
+
+                eta_str = f"{int(total_estimated_runtime//3600):02}:{int((total_estimated_runtime%3600)//60):02}:{int(total_estimated_runtime%60):02}" if total_estimated_runtime is not None else "N/A"
                 logger.info(
                     f"╔═══════════════════════════════════════════════════════════════════╗"
-                    f"\n║ HEARTBEAT [{elapsed_str}]"
+                    f"\n║ HEARTBEAT [{elapsed_str}] — ETA: {eta_str}"
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ DATA COLLECTION                                                   "
                     f"\n║   CS Tools Queries: {cs_done:>6,} / {total_buids_known:<6,} ({progress*100:>5.1f}%)"
@@ -164,9 +196,9 @@ async def person_raw_flow(
                     f"\n║     └─ Without Terms: {metrics['cs_empty']:>6,} people (BUID only)"
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ API BATCHES (Person API)                                          "
-                    f"\n║   Student Batches:    {metrics['uidcarterm_batches_completed']:>3} completed"
-                    f"\n║   BUID Batches:       {metrics['buid_batches_completed']:>3} completed"
-                    f"\n║   Total:              {total_batches_completed:>3} completed"
+                    f"\n║   Student Batches:    {metrics['uidcarterm_batches_completed']:>3} / {est_term_batches:<3} completed"
+                    f"\n║   BUID Batches:       {metrics['buid_batches_completed']:>3} / {est_buid_batches:<3} completed"
+                    f"\n║   Total:              {total_batches_completed:>3} / {est_batches_total:<3} completed"
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ DATABASE OPERATIONS                                               "
                     f"\n║   Persons Received:   {metrics['persons_received']:>6,}"
