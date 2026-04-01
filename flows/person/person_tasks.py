@@ -60,8 +60,7 @@ async def query_cs_single(
     buids_only: list,
     uidCarTerms_threshold_event: asyncio.Event,
     buids_threshold_event: asyncio.Event,
-    uidcarterm_batch_size: int,
-    buid_batch_size: int,
+    batch_threshold: int,
 ) -> None:
     async with cs_sem:
         metrics["cs_queried"] += 1
@@ -78,13 +77,13 @@ async def query_cs_single(
                     metrics["cs_success"] += 1
                     metrics["uidcarterm_total"] += len(uidCarTerm)
                     uidCarTerms.append(uidCarTerm)
-                    if len([item for row in uidCarTerms for item in row]) >= uidcarterm_batch_size:
+                    if len(uidCarTerms) >= batch_threshold:
                         uidCarTerms_threshold_event.set()
                 else:
                     metrics["cs_empty"] += 1
                     metrics["buids_only_count"] += 1
                     buids_only.append(buid)
-                    if len(buids_only) >= buid_batch_size:
+                    if len(buids_only) >= batch_threshold:
                         buids_threshold_event.set()
                 return
             except Exception as e:
@@ -107,8 +106,7 @@ async def query_all_buids_task(
     buids_only: list,
     uidCarTerms_threshold_event: asyncio.Event,
     buids_threshold_event: asyncio.Event,
-    uidcarterm_batch_size: int,
-    buid_batch_size: int,
+    batch_threshold: int,
 ) -> None:
     logger = get_run_logger()
     logger.info(f"⏳ Starting CS Tools queries for {len(buids)} BUIDs...")
@@ -124,8 +122,7 @@ async def query_all_buids_task(
             buids_only=buids_only,
             uidCarTerms_threshold_event=uidCarTerms_threshold_event,
             buids_threshold_event=buids_threshold_event,
-            uidcarterm_batch_size=uidcarterm_batch_size,
-            buid_batch_size=buid_batch_size,
+            batch_threshold=batch_threshold,
         ) for buid in buids),
         return_exceptions=True
     )

@@ -1,10 +1,9 @@
 import asyncio
-import asyncpg
 import json
 from datetime import datetime
 from prefect import flow
 from prefect.logging import get_run_logger
-from config.resources import PostgresResource, SnapLogicCourseApiResource, AsyncpgPoolResource
+from config.resources import PostgresResource, SnapLogicCourseApiResource
 from flows.course.course_tasks import fetch_active_terms_task, fetch_course_details_for_term_task, insert_courses_batch_task
 
 
@@ -14,12 +13,10 @@ async def course_raw_flow():
     INSERT_BATCH_SIZE = 50
     INSERT_SEMAPHORE_LIMIT = 4
 
-    postgres_engine = PostgresResource.get_engine()
+    asyncpg_pool = await PostgresResource.get_pool()
     snaplogic_config = SnapLogicCourseApiResource.get_config()
-    asyncpg_pool_config = AsyncpgPoolResource.get_pool_config()
-    asyncpg_pool = await asyncpg.create_pool(**asyncpg_pool_config)
 
-    terms = await fetch_active_terms_task(postgres_engine)
+    terms = await fetch_active_terms_task(asyncpg_pool)
     logger.info(f"📚 Fetching course data for {len(terms)} terms: {', '.join(terms)}")
 
     #TODO: Call Get Course Offerings with term first, and merge with course details here
@@ -48,7 +45,6 @@ async def course_raw_flow():
     await asyncio.gather(*tasks, return_exceptions=True)
 
     await asyncpg_pool.close()
-    await postgres_engine.dispose()
 
     logger.info(f"✅ COURSE_RAW_FLOW COMPLETE - Inserted: {metrics['insert_success']:,}/{len(courses):,} | Errors: {metrics['errors']} | Skipped: {metrics['type_skipped']} | Batches: {metrics['batches_completed']}/{metrics['batches_total']}")
 

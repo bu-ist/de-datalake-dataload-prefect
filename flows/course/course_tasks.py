@@ -6,20 +6,15 @@ from typing import List, Dict
 from prefect import task
 from prefect.cache_policies import NONE as NO_CACHE
 from prefect.logging import get_run_logger
-from sqlalchemy.ext.asyncio import async_sessionmaker
-from sqlalchemy import text
 from flows.utils.db import batch_insert_with_retry
 
 
 @task(name="fetch-active-terms", retries=2, retry_delay_seconds=30, tags=["fetch-terms"])
-async def fetch_active_terms_task(postgres_engine) -> List[str]:
+async def fetch_active_terms_task(asyncpg_pool) -> List[str]:
     logger = get_run_logger()
-    session_factory = async_sessionmaker(postgres_engine, expire_on_commit=False)
-    
-    async with session_factory() as session:
-        async with session.begin():
-            terms = (await session.execute(text("SELECT strm FROM term_curated.term_data_by_service WHERE service='active_terms'"))).scalars().all()
-    
+    async with asyncpg_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT strm FROM term_curated.term_data_by_service WHERE service='active_terms'")
+    terms = [r["strm"] for r in rows]
     logger.info(f"✅ Retrieved {len(terms)} active terms")
     return terms
 

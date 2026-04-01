@@ -12,16 +12,16 @@ async def term_raw_flow():
     flow_start = datetime.now()
     logger.info("🚀 TERM_RAW_FLOW STARTING")
 
-    postgres_engine = PostgresResource.get_engine()
+    asyncpg_pool = await PostgresResource.get_pool()
     cstools_config = CsToolsResource.get_config()
 
     log_step_header(logger, 1, "Fetching term data from Campus Solutions Tools")
     rows = await fetch_terms_from_cs_tools_task(cstools_config)
-    
-    log_step_header(logger, 2, "Inserting data into database")
-    records_inserted = await insert_term_data_task(rows, postgres_engine)
 
-    await postgres_engine.dispose()
+    log_step_header(logger, 2, "Inserting data into database")
+    records_inserted = await insert_term_data_task(rows, asyncpg_pool)
+
+    await asyncpg_pool.close()
     
     flow_duration = (datetime.now() - flow_start).total_seconds()
     logger.info(f"\n✅ TERM_RAW_FLOW COMPLETE - Records: {records_inserted:,} | Duration: {flow_duration:.2f}s | Status: SUCCESS")

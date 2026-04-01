@@ -4,8 +4,7 @@ import httpx
 from datetime import datetime
 from prefect import flow
 from prefect.logging import get_run_logger
-import asyncpg
-from config.resources import AsyncpgPoolResource, DEPersonApiResource, CsToolsResource, SAPApiResource
+from config.resources import PostgresResource, DEPersonApiResource, CsToolsResource, SAPApiResource
 from flows.person.person_tasks import fetch_buids_from_cs_tools_task, fetch_buids_from_sap_task, query_all_buids_task, process_uidCarTerms_batch_task, process_buids_batch_task, insert_persons_batch_task
 
 # Non-serializable shared state for inline subflows (same process/event loop).
@@ -114,15 +113,12 @@ async def person_inserts_subflow(n_workers: int) -> None:
 
 @flow(name="person-raw-flow", description="Retrieves person data from Data Engineering Person API and inserts into Postgres database", retries=1, retry_delay_seconds=300, log_prints=True)
 async def person_raw_flow(
-    uidcarterm_batch_size: int = 600,
-    buid_batch_size: int = 100,
     cstools_semaphore_limit: int = 10,
     person_api_semaphore_limit: int = 5,
     insert_semaphore_limit: int = 100,
 ):
     logger = get_run_logger()
 
-    asyncpg_pool_config = AsyncpgPoolResource.get_pool_config()
     person_api_config = DEPersonApiResource.get_config()
     cstools_config = CsToolsResource.get_config()
     sap_api_config = SAPApiResource.get_config()
@@ -162,13 +158,12 @@ async def person_raw_flow(
                     est_buid_batches = batch_counter["buids"]
                     est_batches_total = est_term_batches + est_buid_batches
                 elif cs_done > 0:
-                    avg_terms_per_student = metrics["uidcarterm_total"] / metrics["cs_success"] if metrics["cs_success"] > 0 else 0
                     frac_with_terms = metrics["cs_success"] / cs_done
                     remaining_buids = total_buids_known - cs_done
-                    est_total_terms = metrics["uidcarterm_total"] + int(remaining_buids * frac_with_terms * avg_terms_per_student)
-                    est_term_batches = math.ceil(est_total_terms / uidcarterm_batch_size) if est_total_terms > 0 else 0
-                    est_total_buids_without_terms = int((metrics["cs_empty"] / cs_done) * total_buids_known)
-                    est_buid_batches = math.ceil(est_total_buids_without_terms / buid_batch_size) if est_total_buids_without_terms > 0 else 0
+                    est_total_term_buids = metrics["cs_success"] + int(remaining_buids * frac_with_terms)
+                    est_term_batches = math.ceil(est_total_term_buids / batch_threshold) if est_total_term_buids > 0 else 0
+                    est_total_buid_buids = metrics["cs_empty"] + int(remaining_buids * (1 - frac_with_terms))
+                    est_buid_batches = math.ceil(est_total_buid_buids / batch_threshold) if est_total_buid_buids > 0 else 0
                     est_batches_total = est_term_batches + est_buid_batches
                 else:
                     est_term_batches = 0
@@ -214,32 +209,33 @@ async def person_raw_flow(
 
     heartbeat = asyncio.create_task(monitor_progress())
 
-    # Phase 1: Fetch BUIDs
-    try:
-        cs_buids = await fetch_buids_from_cs_tools_task(cstools_config)
-    except Exception as e:
-        logger.error(f"❌ Failed CS Tools fetch: {type(e).__name__}: {e}")
-        raise
-
+    # Phase 1: Fetch BUIDs (concurrent)
     #TODO: Fetch ENS population too, or call EVERY Population.
-
     #TODO: Re-enable VDS BUID fetch after new credentials are set up
-
-    try:
-        sap_buids = await fetch_buids_from_sap_task(sap_api_config)
-    except Exception as e:
-        logger.error(f"❌ Failed SAP fetch: {type(e).__name__}: {e}")
-        raise
+    cs_result, sap_result = await asyncio.gather(
+        fetch_buids_from_cs_tools_task(cstools_config),
+        fetch_buids_from_sap_task(sap_api_config),
+        return_exceptions=True,
+    )
+    if isinstance(cs_result, Exception):
+        logger.error(f"❌ Failed CS Tools fetch: {type(cs_result).__name__}: {cs_result}")
+        raise cs_result
+    if isinstance(sap_result, Exception):
+        logger.error(f"❌ Failed SAP fetch: {type(sap_result).__name__}: {sap_result}")
+        raise sap_result
+    cs_buids, sap_buids = cs_result, sap_result
 
     buids = list(set(cs_buids + sap_buids))
+    buids = buids[:250] #TODO: Remove this limit after testing
     phase_info["total_buids"] = len(buids)
-    logger.info(f"✅ Processing {len(buids):,} unique BUIDs")
+    batch_threshold = max(1, len(buids) // person_api_semaphore_limit)
+    logger.info(f"✅ Processing {len(buids):,} unique BUIDs (batch_threshold={batch_threshold})")
 
     #TODO: Any failed BUIDs will go into the person_live_update queue for reprocessing
 
     # Set up pipeline shared state (non-serializable — accessible to the inline subflows
     # because they run in the same process/event loop via asyncio.create_task)
-    asyncpg_pool = await asyncpg.create_pool(**asyncpg_pool_config)
+    asyncpg_pool = await PostgresResource.get_pool()
     queue: asyncio.Queue = asyncio.Queue()
     insert_queue: asyncio.Queue = asyncio.Queue()
     first_insert_event = asyncio.Event()
@@ -339,8 +335,7 @@ async def person_raw_flow(
             buids_only=buids_only,
             uidCarTerms_threshold_event=uidCarTerms_threshold_event,
             buids_threshold_event=buids_threshold_event,
-            uidcarterm_batch_size=uidcarterm_batch_size,
-            buid_batch_size=buid_batch_size,
+            batch_threshold=batch_threshold,
         )
         all_cs_done.set()
         await monitor_task

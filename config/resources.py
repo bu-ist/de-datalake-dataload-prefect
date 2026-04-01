@@ -1,37 +1,21 @@
+import asyncpg
 import base64
-from sqlalchemy.engine import URL
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from typing import Dict
 from config.settings import settings
 
 
 class PostgresResource:
     @staticmethod
-    def get_engine() -> AsyncEngine:
-        url = URL.create(
-            drivername="postgresql+psycopg",
-            username=settings.postgres_user,
-            password=settings.postgres_pass,
+    async def get_pool(min_size: int = 12, max_size: int = 24) -> asyncpg.Pool:
+        return await asyncpg.create_pool(
             host=settings.postgres_host,
             port=settings.postgres_port,
             database=settings.postgres_db,
+            user=settings.postgres_user,
+            password=settings.postgres_pass,
+            min_size=min_size,
+            max_size=max_size,
         )
-        return create_async_engine(url, pool_pre_ping=True, future=True)
-
-
-#TODO: Remove as we no longer use copy
-class AsyncpgPoolResource:
-    @staticmethod
-    def get_pool_config() -> Dict[str, any]:
-        return {
-            "host": settings.postgres_host,
-            "port": settings.postgres_port,
-            "database": settings.postgres_db,
-            "user": settings.postgres_user,
-            "password": settings.postgres_pass,
-            "min_size": 12,
-            "max_size": 24,
-        }
 
 
 class SnapLogicCourseApiResource:

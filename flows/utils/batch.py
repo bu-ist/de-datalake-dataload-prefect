@@ -3,6 +3,20 @@ from typing import List, TypeVar
 T = TypeVar('T')
 
 
+def split_evenly(lst: List[T], n: int) -> List[List[T]]:
+    """Split lst into n roughly-equal chunks. If len(lst) < n, returns fewer chunks."""
+    n = min(n, len(lst))
+    if n == 0:
+        return []
+    k, m = divmod(len(lst), n)
+    chunks, start = [], 0
+    for i in range(n):
+        end = start + k + (1 if i < m else 0)
+        chunks.append(lst[start:end])
+        start = end
+    return chunks
+
+
 def create_batches(items: List[T], batch_size: int) -> List[List[T]]:
     return [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
 
