@@ -4,7 +4,7 @@ A Prefect workflow orchestration project for managing data lake loading operatio
 
 ## Project Overview
 
-This project handles ETL operations for loading data from various sources (Campus Solutions Tools, Data Engineering API, SnapLogic, VDS, SAP) into a PostgreSQL data lake. It consists of three main flows:
+This project handles ETL operations for loading data from various sources (Campus Solutions Tools, Data Engineering Person API, SnapLogic, SAP) into a PostgreSQL data lake. It consists of three main flows:
 
 1. **Term Raw Flow** - Loads term data from Campus Solutions Tools (runs at 1:00 AM ET daily)
 2. **Course Raw Flow** - Loads course data from SnapLogic (runs at 2:00 AM ET daily)
@@ -14,36 +14,42 @@ This project handles ETL operations for loading data from various sources (Campu
 
 ```
 DatalakeDataload/
-├── flows/                      # Prefect flow definitions
+├── flows/                          # Prefect flow definitions
 │   ├── __init__.py
-│   ├── term_raw_flow.py       # Term data loading flow
-│   ├── course_raw_flow.py     # Course data loading flow
-│   └── person_raw_flow.py     # Person data loading flow
-├── tasks/                      # Reusable Prefect tasks (currently empty)
-│   └── __init__.py
-├── config/                     # Configuration modules
+│   ├── person/
+│   │   ├── person_flow.py         # Person data loading flow
+│   │   └── person_tasks.py        # Person flow tasks
+│   ├── course/
+│   │   ├── course_flow.py         # Course data loading flow
+│   │   └── course_tasks.py        # Course flow tasks
+│   ├── term/
+│   │   ├── term_flow.py           # Term data loading flow
+│   │   └── term_tasks.py          # Term flow tasks
+│   └── utils/
+│       ├── batch.py               # Batch splitting utilities
+│       ├── db.py                  # Database utilities
+│       └── logging_helpers.py     # Logging utilities
+├── config/                         # Configuration modules
 │   ├── __init__.py
-│   ├── settings.py            # Environment variables and settings
-│   └── resources.py           # Database and API connection resources
-├── deployments/               # Deployment configurations
+│   ├── settings.py                # Environment variables and settings
+│   └── resources.py               # Database and API connection resources
+├── deployments/                    # Deployment configurations
 │   ├── term_raw_deployment.py
 │   ├── course_raw_deployment.py
 │   └── person_raw_deployment.py
-├── prefect.yaml               # Prefect project configuration
-├── requirements.txt           # Python dependencies
-├── .env.example              # Example environment variables
-└── README.md                 # This file
+├── prefect.yaml                    # Prefect project configuration
+├── pyproject.toml                  # Python project and dependency config
+├── .env.example                   # Example environment variables
+└── README.md                      # This file
 ```
 
 ## Architecture Overview
 
 - **Prefect** – Workflow orchestration and flow execution
-- **SQLAlchemy (async)** – Database interactions
 - **httpx** – Asynchronous HTTP-based integration with external APIs
-- **asyncio** – Managing concurrent API calls
-- **DeepDiff** – Object comparison for data change detection
+- **asyncio** – Managing concurrent API calls and pipeline stages
 - **PostgreSQL** – Data lake storage (target database)
-- **asyncpg** – Async PostgreSQL driver for COPY operations and batch inserts
+- **asyncpg** – Async PostgreSQL driver for batch inserts
 
 ## Data Pipeline Architecture
 
@@ -51,17 +57,17 @@ DatalakeDataload/
 
 The project uses a three-layer data architecture for all pipelines (Person, Course, and Term):
 
-1. **Raw Layer** (`*_raw` schemas)  
+1. **Raw Layer** (`*_raw` schemas)
    - INSERT-only operations performed by Prefect flows
    - Retains historical log of all changes
    - Examples: `person_raw.person_data`, `course_raw.course_data`, `term_raw.term_data`
 
-2. **Transform Layer** (`*_xform` schemas)  
+2. **Transform Layer** (`*_xform` schemas)
    - UPSERT operations managed by SQL triggers and functions
    - Always contains the current state of data
    - Examples: `person_xform.current_person_data`, `course_xform.current_course_data`, `term_xform.current_term_data`
 
-3. **Curated Layer** (`*_curated` schemas)  
+3. **Curated Layer** (`*_curated` schemas)
    - UPSERT operations managed by SQL triggers and functions
    - Service-based filtering using JSON path definitions
    - Examples: `person_curated.person_data_by_service`, `course_curated.course_data_by_service`, `term_curated.term_data_by_service`
@@ -118,7 +124,7 @@ The project uses a three-layer data architecture for all pipelines (Person, Cour
 - Python 3.9 or higher (requires Python >=3.9, <3.14)
 - Prefect 2.14.0 or higher
 - PostgreSQL database
-- Access to PeopleSoft, Data Engineering Person API, SnapLogic, VDS, and SAP APIs
+- Access to Data Engineering Person API, Campus Solutions Tools, SnapLogic, and SAP APIs
 
 ## Setup
 
@@ -186,13 +192,13 @@ prefect cloud login
 
 ```bash
 # Run term flow
-python flows/term_raw_flow.py
+python flows/term/term_flow.py
 
 # Run course flow
-python flows/course_raw_flow.py
+python flows/course/course_flow.py
 
 # Run person flow
-python flows/person_raw_flow.py
+python flows/person/person_flow.py
 ```
 
 ### Create Deployments
@@ -243,7 +249,7 @@ prefect deployment run 'person-raw-flow/person-raw-daily'
 
 ### Term Raw Flow
 - **Schedule**: Daily at 1:00 AM ET
-- **Source**: Campus Solutions Tools BU_TERM_QRY
+- **Source**: Campus Solutions Tools `BU_TERM_QRY`
 - **Target**: `term_raw.term_data` table
 - **Description**: Fetches term data from Campus Solutions Tools, truncates the target table, and inserts new data in JSONB format
 
@@ -255,13 +261,57 @@ prefect deployment run 'person-raw-flow/person-raw-daily'
 
 ### Person Raw Flow
 - **Schedule**: Daily at 3:00 AM ET
-- **Sources**: Campus Solutions Tools, SAP, VDS (commented out), Data Engineering Person API
+- **Sources**: Campus Solutions Tools, SAP, Data Engineering Person API
 - **Target**: `person_raw.person_data` table
-- **Description**:
-  1. Fetches BUIDs from Campus Solutions Tools and SAP
-  2. Queries Campus Solutions Tools for uidCarTerm data for each BUID
-  3. Batches BUIDs and sends to Data Engineering Person API
-  4. Inserts person data with sensitive fields removed
+- **Description**: Three-stage concurrent pipeline:
+  1. **BUIDs fetch** — CS Tools and SAP queried in parallel to build the full BUID population
+  2. **CS Tools queries** — Each BUID queried for uidCarTerm data concurrently; results accumulate into rolling batches for students (with terms) and BUIDs-only (without terms)
+  3. **Person API + DB inserts** — Batches are streamed to the Data Engineering Person API concurrently; results are inserted into `person_raw.person_data` as they arrive, with sensitive fields (`ssn`, `socialSecurityNumber`, `sexualOrientation`, `finAid`, `finAidReceived`) stripped before insert
+
+---
+
+## Running the Person Flow Ad-Hoc
+
+The person flow accepts three concurrency parameters that control throughput. These can be passed when triggering a run manually.
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `cstools_semaphore_limit` | `10` | Max concurrent CS Tools queries per BUID |
+| `person_api_semaphore_limit` | `5` | Max concurrent Person API batch calls (each batch ~5 min) |
+| `insert_semaphore_limit` | `24` | Max concurrent DB insert workers (capped by pool max of 24) |
+
+### Via Prefect CLI
+
+```bash
+prefect deployment run 'person-raw-flow/person-raw-daily' \
+  --param cstools_semaphore_limit=20 \
+  --param person_api_semaphore_limit=10 \
+  --param insert_semaphore_limit=24
+```
+
+### Via Python (local)
+
+```python
+import asyncio
+from flows.person.person_flow import person_raw_flow
+
+asyncio.run(person_raw_flow(
+    cstools_semaphore_limit=20,
+    person_api_semaphore_limit=10,
+    insert_semaphore_limit=24,
+))
+```
+
+### Tuning Notes
+
+- **`cstools_semaphore_limit`** is the first bottleneck — increasing it speeds up the BUID→term query phase. Raise it if CS Tools can handle the load.
+- **`person_api_semaphore_limit`** controls how many ~5-minute Person API calls run in parallel. This is the dominant runtime factor. Increasing it proportionally reduces total run time, subject to API capacity.
+- **`insert_semaphore_limit`** should not exceed the asyncpg pool's `max_size` (24). Extra workers beyond that just queue for connections.
+- The `batch_threshold` (records per Person API batch) is derived automatically as `len(buids) // person_api_semaphore_limit`, so raising `person_api_semaphore_limit` also produces more, smaller batches.
+
+---
 
 ## Development
 
@@ -270,14 +320,9 @@ prefect deployment run 'person-raw-flow/person-raw-daily'
 All flows support async execution and can be tested locally:
 
 ```bash
-# Run with asyncio
-python -c "import asyncio; from flows.term_raw_flow import term_raw_flow; asyncio.run(term_raw_flow())"
-```
-
-Or simply execute the flow file:
-
-```bash
-python flows/term_raw_flow.py
+python flows/person/person_flow.py
+python flows/course/course_flow.py
+python flows/term/term_flow.py
 ```
 
 ### View Flow Runs in UI
@@ -334,42 +379,31 @@ python deployments/term_raw_deployment.py
 
 ### Adding New Flows
 
-1. Create a new flow file in the `flows/` directory
-2. Define your flow using the `@flow` decorator
-3. Import resources from `config.resources`
-4. Add tasks using async/await patterns
-5. Update `flows/__init__.py` to export your flow
-6. Create a deployment configuration in `deployments/`
+1. Create a new directory under `flows/` for your flow
+2. Define your flow using the `@flow` decorator in `<name>_flow.py`
+3. Define tasks using the `@task` decorator in `<name>_tasks.py`
+4. Import resources from `config.resources`
+5. Create a deployment configuration in `deployments/`
 
 ## Performance Tuning
 
 ### Asyncpg Connection Pool
 
-The asyncpg connection pool sizes are hardcoded in `config/resources.py`:
+The asyncpg connection pool is configured in [config/resources.py](config/resources.py):
 - Minimum pool size: 12 connections
 - Maximum pool size: 24 connections
 
-To adjust these values, edit the `AsyncpgPoolResource.get_pool_config()` method in [config/resources.py](config/resources.py).
+### Person Flow Concurrency
 
-### Semaphore Limits (Person Flow)
-
-The person flow uses semaphores to control concurrency:
+The person flow defaults are set in [flows/person/person_flow.py](flows/person/person_flow.py):
 
 ```python
-CSTOOLS_SEMAPHORE_LIMIT = 10      # Concurrent Campus Solutions Tools queries
-SNAPLOGIC_SEMAPHORE_LIMIT = 8     # Concurrent SnapLogic requests
-INSERT_SEMAPHORE_LIMIT = 100      # Concurrent database inserts
+cstools_semaphore_limit: int = 10     # Concurrent CS Tools queries
+person_api_semaphore_limit: int = 5   # Concurrent Person API batch calls
+insert_semaphore_limit: int = 24      # Concurrent DB inserts (matches pool max)
 ```
 
-Adjust these values in `flows/person_raw_flow.py` based on your infrastructure.
-
-### Batch Sizes
-
-Course flow batch size can be adjusted:
-
-```python
-INSERT_BATCH_SIZE = 50            # Records per batch insert
-```
+See [Running the Person Flow Ad-Hoc](#running-the-person-flow-ad-hoc) for tuning guidance.
 
 ## Monitoring & Alerts
 
@@ -389,6 +423,8 @@ from prefect.logging import get_run_logger
 logger = get_run_logger()
 logger.info("Your message here")
 ```
+
+The person flow emits a heartbeat log every 15 seconds with a live progress table showing CS Tools query progress, Person API batch status, and DB insert counts.
 
 ## Best Practices
 
@@ -411,7 +447,7 @@ logger.info("Your message here")
 
 - Verify database credentials in `.env`
 - Check network connectivity to database
-- Ensure asyncpg and psycopg are installed
+- Ensure asyncpg is installed
 - Test connection: `psql -h $POSTGRES_HOST -U $POSTGRES_USER -d $POSTGRES_DB`
 
 ### API Authentication Issues
@@ -424,14 +460,7 @@ logger.info("Your message here")
 
 - Verify all dependencies are installed: `pip install -r requirements.txt`
 - Check that you're using the correct Python environment
-- Ensure Python 3.8+ is being used
-
-### Person Flow Memory Issues
-
-If the person flow runs out of memory:
-- Reduce `UIDCARTERM_GROUP_SIZE` (default: 1000)
-- Reduce `insert_queue` max size (default: 20000)
-- Reduce semaphore limits
+- Ensure Python 3.9+ is being used
 
 ## Resources
 

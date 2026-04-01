@@ -116,6 +116,8 @@ async def person_raw_flow(
     cstools_semaphore_limit: int = 10,
     person_api_semaphore_limit: int = 5,
     insert_semaphore_limit: int = 100,
+    uidcarterm_batch_size: int = 600,
+    buid_batch_size: int = 100,
 ):
     logger = get_run_logger()
 
@@ -158,12 +160,13 @@ async def person_raw_flow(
                     est_buid_batches = batch_counter["buids"]
                     est_batches_total = est_term_batches + est_buid_batches
                 elif cs_done > 0:
+                    avg_terms_per_student = metrics["uidcarterm_total"] / metrics["cs_success"] if metrics["cs_success"] > 0 else 0
                     frac_with_terms = metrics["cs_success"] / cs_done
                     remaining_buids = total_buids_known - cs_done
-                    est_total_term_buids = metrics["cs_success"] + int(remaining_buids * frac_with_terms)
-                    est_term_batches = math.ceil(est_total_term_buids / batch_threshold) if est_total_term_buids > 0 else 0
-                    est_total_buid_buids = metrics["cs_empty"] + int(remaining_buids * (1 - frac_with_terms))
-                    est_buid_batches = math.ceil(est_total_buid_buids / batch_threshold) if est_total_buid_buids > 0 else 0
+                    est_total_terms = metrics["uidcarterm_total"] + int(remaining_buids * frac_with_terms * avg_terms_per_student)
+                    est_term_batches = math.ceil(est_total_terms / uidcarterm_batch_size) if est_total_terms > 0 else 0
+                    est_total_buids_without_terms = int((metrics["cs_empty"] / cs_done) * total_buids_known)
+                    est_buid_batches = math.ceil(est_total_buids_without_terms / buid_batch_size) if est_total_buids_without_terms > 0 else 0
                     est_batches_total = est_term_batches + est_buid_batches
                 else:
                     est_term_batches = 0
@@ -226,10 +229,8 @@ async def person_raw_flow(
     cs_buids, sap_buids = cs_result, sap_result
 
     buids = list(set(cs_buids + sap_buids))
-    buids = buids[:250] #TODO: Remove this limit after testing
     phase_info["total_buids"] = len(buids)
-    batch_threshold = max(1, len(buids) // person_api_semaphore_limit)
-    logger.info(f"✅ Processing {len(buids):,} unique BUIDs (batch_threshold={batch_threshold})")
+    logger.info(f"✅ Processing {len(buids):,} unique BUIDs")
 
     #TODO: Any failed BUIDs will go into the person_live_update queue for reprocessing
 
@@ -335,7 +336,8 @@ async def person_raw_flow(
             buids_only=buids_only,
             uidCarTerms_threshold_event=uidCarTerms_threshold_event,
             buids_threshold_event=buids_threshold_event,
-            batch_threshold=batch_threshold,
+            uidcarterm_batch_size=uidcarterm_batch_size,
+            buid_batch_size=buid_batch_size,
         )
         all_cs_done.set()
         await monitor_task
