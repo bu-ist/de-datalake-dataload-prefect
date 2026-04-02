@@ -3,25 +3,25 @@ import json
 from datetime import datetime
 from prefect import flow
 from prefect.logging import get_run_logger
-from config.resources import PostgresResource, SnapLogicCourseApiResource
+from config.resources import PostgresResource, CourseApiResource
 from flows.course.course_tasks import fetch_active_terms_task, fetch_course_details_for_term_task, insert_courses_batch_task
 
 
-@flow(name="course-raw-flow", description="Retrieves course data from the SnapLogic API and prepares it for insertion into the Postgres database", retries=1, retry_delay_seconds=300, log_prints=True)
+@flow(name="course-raw-flow", description="Retrieves course data from the course API and prepares it for insertion into the Postgres database", retries=1, retry_delay_seconds=300, log_prints=True)
 async def course_raw_flow():
     logger = get_run_logger()
     INSERT_BATCH_SIZE = 50
     INSERT_SEMAPHORE_LIMIT = 4
 
     asyncpg_pool = await PostgresResource.get_pool()
-    snaplogic_config = SnapLogicCourseApiResource.get_config()
+    course_api_config = CourseApiResource.get_config()
 
     terms = await fetch_active_terms_task(asyncpg_pool)
     logger.info(f"📚 Fetching course data for {len(terms)} terms: {', '.join(terms)}")
 
     #TODO: Call Get Course Offerings with term first, and merge with course details here
 
-    courses_list = await asyncio.gather(*[fetch_course_details_for_term_task(term, snaplogic_config) for term in terms], return_exceptions=True)
+    courses_list = await asyncio.gather(*[fetch_course_details_for_term_task(term, course_api_config) for term in terms], return_exceptions=True)
     
     successful_courses = [c for c in courses_list if not isinstance(c, Exception)]
     if len(successful_courses) < len(courses_list):

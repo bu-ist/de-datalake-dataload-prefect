@@ -12,6 +12,32 @@ from flows.person.person_tasks import fetch_buids_from_cs_tools_task, fetch_buid
 _batch_context: dict = {}
 
 
+@flow(name="fetch-buids", log_prints=True)
+async def fetch_buids_subflow(
+    cstools_config: dict,
+    sap_api_config: dict,
+) -> list:
+    """
+    Concurrently fetches BUIDs from CS Tools and SAP, deduplicates, and logs the full unique set.
+    """
+    logger = get_run_logger()
+    cs_result, sap_result = await asyncio.gather(
+        fetch_buids_from_cs_tools_task(cstools_config),
+        fetch_buids_from_sap_task(sap_api_config),
+        return_exceptions=True,
+    )
+    if isinstance(cs_result, Exception):
+        logger.error(f"❌ Failed CS Tools fetch: {type(cs_result).__name__}: {cs_result}")
+        raise cs_result
+    if isinstance(sap_result, Exception):
+        logger.error(f"❌ Failed SAP fetch: {type(sap_result).__name__}: {sap_result}")
+        raise sap_result
+
+    buids = list(set(cs_result + sap_result))
+    logger.info(f"✅ {len(buids):,} unique BUIDs: [{', '.join(sorted(buids))}]")
+    return buids
+
+
 @flow(name="person-api-batches", log_prints=True)
 async def person_batches_subflow(
     n_workers: int,
@@ -215,22 +241,8 @@ async def person_raw_flow(
     # Phase 1: Fetch BUIDs (concurrent)
     #TODO: Fetch ENS population too, or call EVERY Population.
     #TODO: Re-enable VDS BUID fetch after new credentials are set up
-    cs_result, sap_result = await asyncio.gather(
-        fetch_buids_from_cs_tools_task(cstools_config),
-        fetch_buids_from_sap_task(sap_api_config),
-        return_exceptions=True,
-    )
-    if isinstance(cs_result, Exception):
-        logger.error(f"❌ Failed CS Tools fetch: {type(cs_result).__name__}: {cs_result}")
-        raise cs_result
-    if isinstance(sap_result, Exception):
-        logger.error(f"❌ Failed SAP fetch: {type(sap_result).__name__}: {sap_result}")
-        raise sap_result
-    cs_buids, sap_buids = cs_result, sap_result
-
-    buids = list(set(cs_buids + sap_buids))
+    buids = await fetch_buids_subflow(cstools_config, sap_api_config)
     phase_info["total_buids"] = len(buids)
-    logger.info(f"✅ Processing {len(buids):,} unique BUIDs")
 
     #TODO: Any failed BUIDs will go into the person_live_update queue for reprocessing
 

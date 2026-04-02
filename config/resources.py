@@ -18,7 +18,7 @@ class PostgresResource:
         )
 
 
-class SnapLogicCourseApiResource:
+class CourseApiResource:
     @staticmethod
     def get_config() -> Dict[str, any]:
         return {

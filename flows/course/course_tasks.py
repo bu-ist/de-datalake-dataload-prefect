@@ -20,7 +20,7 @@ async def fetch_active_terms_task(asyncpg_pool) -> List[str]:
 
 
 @task(name="fetch-course-details-for-term", retries=2, retry_delay_seconds=30, task_run_name="fetch-courses-{term}", cache_policy=NO_CACHE, tags=["fetch-courses"])
-async def fetch_course_details_for_term_task(term: str, snaplogic_config: dict) -> List[dict]:
+async def fetch_course_details_for_term_task(term: str, course_api_config: dict) -> List[dict]:
     logger = get_run_logger()
     
     async with httpx.AsyncClient() as client:
@@ -28,9 +28,9 @@ async def fetch_course_details_for_term_task(term: str, snaplogic_config: dict) 
             logger.info(f"📡 Fetching courses for term {term}...")
             fetch_start = datetime.now()
             resp = await client.get(
-                snaplogic_config["url"],
-                params={"term": term, "csEnv": snaplogic_config["cs_env"]},
-                headers=snaplogic_config["headers"],
+                course_api_config["url"],
+                params={"term": term, "csEnv": course_api_config["cs_env"]},
+                headers=course_api_config["headers"],
                 timeout=36000,
             )
             resp.raise_for_status()

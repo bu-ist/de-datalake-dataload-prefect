@@ -11,8 +11,8 @@ deployment = Deployment.build_from_flow(
         cron="0 2 * * *",
         timezone="America/New_York"
     ),
-    tags=["raw", "course", "snaplogic"],
-    description="Daily course data load from SnapLogic at 2:00 AM ET",
+    tags=["raw", "course"],
+    description="Daily course data load at 2:00 AM ET",
 )
 
 if __name__ == "__main__":
