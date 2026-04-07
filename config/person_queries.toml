@@ -1,0 +1,14 @@
+[[PSQueries]]
+params = {}
+json = {query_name = "BU_PARM_0216_QRY"}
+integrations = ["sonia", "blackbaud", "ens"]
+
+[[PSQueries]]
+params = {}
+json = {query_name = "BU_PARM_ENRL_DORM_QRY"}
+integrations = ["sonia", "blackbaud", "ens"]
+
+[[SAPQueries]]
+params = {BAPIName = "Z_HR_EMPLOYEE_OBJ_LIST", account = "HR"}
+json = {}
+integrations = ["sonia", "adobe", "ens", "blackbaud"]

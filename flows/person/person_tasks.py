@@ -1,52 +1,58 @@
 import asyncio
 import json
+import tomllib
 import httpx
 from datetime import datetime
+from pathlib import Path
 from typing import List
 from prefect import task
 from prefect.cache_policies import NONE as NO_CACHE
 from prefect.logging import get_run_logger
 
+_QUERIES_PATH = Path(__file__).resolve().parents[2] / "config" / "person_queries.toml"
 
-@task(name="fetch-buids-from-cs-tools", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
-async def fetch_buids_from_cs_tools_task(cstools_config: dict) -> List[str]:
+
+@task(name="ps-buid-query", task_run_name="PSQuery-{query_name}", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
+async def fetch_ps_buid_query_task(query: dict, cstools_config: dict, query_name: str) -> List[str]:
     logger = get_run_logger()
-    logger.info(f"📡 Fetching BUIDs from CS Tools...")
-    try:
-        async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
-            resp = await client.post(
-                cstools_config["url"],
-                json={"query_name": "BU_PARM_0216_QRY"},
-                headers=cstools_config["headers"],
-                timeout=30,
-            )
-            resp.raise_for_status()
-            rows = resp.json().get("data", [])
-        buids = [row.get("CAMPUS_ID") for row in rows if row.get("CAMPUS_ID")]
-        logger.info(f"✅ Retrieved {len(buids)} BUIDs from CS Tools")
-        return buids
-    except Exception as e:
-        logger.error(f"❌ Fetch failed: {type(e).__name__}: {e}")
-        raise
+    logger.info(f"📡 PSQuery [{query_name}] — integrations: {query['integrations']}")
+    async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
+        resp = await client.post(
+            cstools_config["url"],
+            params=query["params"] or None,
+            json=query["json"],
+            headers=cstools_config["headers"],
+            timeout=120,
+        )
+        if resp.is_error:
+            logger.error(f"❌ PSQuery [{query_name}] {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+        rows = resp.json().get("data", [])
+    buids = [row.get("CAMPUS_ID") for row in rows if row.get("CAMPUS_ID")]
+    logger.info(f"✅ PSQuery [{query_name}]: {len(buids)} BUIDs retrieved")
+    return buids
 
 
-@task(name="fetch-buids-from-sap", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
-async def fetch_buids_from_sap_task(sap_api_config: dict) -> List[str]:
+@task(name="sap-buid-query", task_run_name="SAP-{bapi_name}", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
+async def fetch_sap_buid_query_task(query: dict, sap_api_config: dict, bapi_name: str) -> List[str]:
     logger = get_run_logger()
-    logger.info(f"📡 Fetching BUIDs from SAP...")
+    logger.info(f"📡 SAP [{bapi_name}] — integrations: {query['integrations']}")
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             sap_api_config["url"],
-            params={"BAPIName": "Z_HR_EMPLOYEE_OBJ_LIST", "account": "HR"},
-            json={},
+            params=query["params"] or None,
+            json=query["json"],
             headers=sap_api_config["headers"],
             timeout=30,
         )
+        if resp.is_error:
+            logger.error(f"❌ SAP [{bapi_name}] {resp.status_code}: {resp.text}")
         resp.raise_for_status()
         rows = resp.json().get("ET_EMP_LIST", [])
     buids = [row.get("BUID") for row in rows if row.get("EMP_STATUS") == "3 - Active" and row.get("BUID")]
-    logger.info(f"✅ Retrieved {len(buids)} BUIDs from SAP")
+    logger.info(f"✅ SAP [{bapi_name}]: {len(buids)} BUIDs retrieved")
     return buids
+
 
 
 async def query_cs_single(
@@ -69,6 +75,8 @@ async def query_cs_single(
             try:
                 payload = {"query_name": "BU_TERM_STD_FULL_TERM", "prompt_names": ["BUID"], "prompt_values": [buid]}
                 resp = await cs_client.post(cstools_config["url"], json=payload, headers=cstools_config["headers"], timeout=30)
+                if resp.is_error:
+                    logger.error(f"❌ CS Tools [{buid}] {resp.status_code}: {resp.text}")
                 resp.raise_for_status()
                 uidCarTerm = resp.json().get('data', [])
 
@@ -181,6 +189,9 @@ async def process_uidCarTerms_batch_task(
         persons = []
         #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
         async with person_api_client.stream("POST", person_api_config["url"], json=payload, timeout=1200) as resp:
+            if resp.is_error:
+                await resp.aread()
+                logger.error(f"❌ Person API batch {batch_id} [Students] {resp.status_code}: {resp.text}")
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line.strip():
@@ -229,6 +240,9 @@ async def process_buids_batch_task(
         persons = []
         #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
         async with person_api_client.stream("POST", person_api_config["url"], json=payload, timeout=10000) as resp:
+            if resp.is_error:
+                await resp.aread()
+                logger.error(f"❌ Person API batch {batch_id} [BUIDs] {resp.status_code}: {resp.text}")
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line.strip():

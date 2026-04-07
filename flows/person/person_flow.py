@@ -1,11 +1,13 @@
 import asyncio
 import math
+import tomllib
 import httpx
 from datetime import datetime
 from prefect import flow
 from prefect.logging import get_run_logger
 from config.resources import PostgresResource, DEPersonApiResource, CsToolsResource, SAPApiResource
-from flows.person.person_tasks import fetch_buids_from_cs_tools_task, fetch_buids_from_sap_task, query_all_buids_task, process_uidCarTerms_batch_task, process_buids_batch_task, insert_persons_batch_task
+from flows.person.person_tasks import fetch_ps_buid_query_task, fetch_sap_buid_query_task, query_all_buids_task, process_uidCarTerms_batch_task, process_buids_batch_task, insert_persons_batch_task
+from flows.person.person_tasks import _QUERIES_PATH
 
 # Non-serializable shared state for inline subflows (same process/event loop).
 # Populated by person_raw_flow before the subflow starts.
@@ -17,23 +19,38 @@ async def fetch_buids_subflow(
     cstools_config: dict,
     sap_api_config: dict,
 ) -> list:
-    """
-    Concurrently fetches BUIDs from CS Tools and SAP, deduplicates, and logs the full unique set.
-    """
     logger = get_run_logger()
-    cs_result, sap_result = await asyncio.gather(
-        fetch_buids_from_cs_tools_task(cstools_config),
-        fetch_buids_from_sap_task(sap_api_config),
+    with open(_QUERIES_PATH, "rb") as f:
+        queries = tomllib.load(f)
+    ps_queries = queries["PSQueries"]
+    sap_queries = queries["SAPQueries"]
+
+    ps_sem = asyncio.Semaphore(5)
+    sap_sem = asyncio.Semaphore(5)
+
+    async def run_ps(query):
+        async with ps_sem:
+            return await fetch_ps_buid_query_task(query, cstools_config, query["json"].get("query_name", "unknown"))
+
+    async def run_sap(query):
+        async with sap_sem:
+            return await fetch_sap_buid_query_task(query, sap_api_config, query["params"].get("BAPIName", "unknown"))
+
+    results = await asyncio.gather(
+        *[run_ps(q) for q in ps_queries],
+        *[run_sap(q) for q in sap_queries],
         return_exceptions=True,
     )
-    if isinstance(cs_result, Exception):
-        logger.error(f"❌ Failed CS Tools fetch: {type(cs_result).__name__}: {cs_result}")
-        raise cs_result
-    if isinstance(sap_result, Exception):
-        logger.error(f"❌ Failed SAP fetch: {type(sap_result).__name__}: {sap_result}")
-        raise sap_result
 
-    buids = list(set(cs_result + sap_result))
+    all_buids = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            label = f"PSQuery {i}" if i < len(ps_queries) else f"SAP query {i - len(ps_queries)}"
+            logger.error(f"❌ {label} failed: {type(result).__name__}: {result}")
+        else:
+            all_buids.extend(result)
+
+    buids = list(set(all_buids))
     logger.info(f"✅ {len(buids):,} unique BUIDs: [{', '.join(sorted(buids))}]")
     return buids
 
