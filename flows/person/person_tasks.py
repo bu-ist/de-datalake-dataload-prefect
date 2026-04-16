@@ -15,43 +15,80 @@ _QUERIES_PATH = Path(__file__).resolve().parents[2] / "config" / "person_queries
 @task(name="ps-buid-query", task_run_name="PSQuery-{query_name}", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
 async def fetch_ps_buid_query_task(query: dict, cstools_config: dict, query_name: str) -> List[str]:
     logger = get_run_logger()
-    logger.info(f"📡 PSQuery [{query_name}] — integrations: {query['integrations']}")
-    async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
-        resp = await client.post(
-            cstools_config["url"],
-            params=query["params"] or None,
-            json=query["json"],
-            headers=cstools_config["headers"],
-            timeout=120,
-        )
-        if resp.is_error:
-            logger.error(f"❌ PSQuery [{query_name}] {resp.status_code}: {resp.text}")
-        resp.raise_for_status()
-        rows = resp.json().get("data", [])
-    buids = [row.get("CAMPUS_ID") for row in rows if row.get("CAMPUS_ID")]
-    logger.info(f"✅ PSQuery [{query_name}]: {len(buids)} BUIDs retrieved")
-    return buids
+    logger.info(f"📡 PSQuery [{query_name}]")
+    try:
+        async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
+            resp = await client.post(
+                cstools_config["url"],
+                params=query.get("params") or None,
+                json=query.get("json") or {},
+                headers=cstools_config["headers"],
+                timeout=120,
+            )
+            if resp.is_error:
+                logger.error(f"❌ PSQuery [{query_name}] {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
+            rows = resp.json().get("data", [])
+        buids = [row.get("CAMPUS_ID") for row in rows if row.get("CAMPUS_ID")]
+        logger.info(f"✅ PSQuery [{query_name}]: {len(buids)} BUIDs retrieved")
+        return buids
+    except Exception as e:
+        logger.error(f"❌ PSQuery [{query_name}] failed: {type(e).__name__}: {e}")
+        raise
+
+
+@task(name="vds-buid-query", task_run_name="VDS-{query_name}", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
+async def fetch_vds_buid_query_task(query: dict, vds_api_config: dict, query_name: str) -> List[str]:
+    logger = get_run_logger()
+    logger.info(f"📡 VDS [{query_name}]")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                vds_api_config["url"],
+                json=query.get("json") or {},
+                headers=vds_api_config["headers"],
+                timeout=60,
+            )
+            if resp.is_error:
+                logger.error(f"❌ VDS [{query_name}] {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
+            data = resp.json()
+            rows = []
+            for item in (data if isinstance(data, list) else [data]):
+                rows.extend(item.get("entity", {}).get("resources", []))
+            logger.info(f"🔍 VDS [{query_name}]: {len(rows)} resources in response")
+        buids = [row.get("attributes", {}).get("PersonBuid") for row in rows if row.get("attributes", {}).get("PersonBuid")]
+        logger.info(f"✅ VDS [{query_name}]: {len(buids)} BUIDs retrieved")
+        return buids
+    except Exception as e:
+        logger.error(f"❌ VDS [{query_name}] failed: {type(e).__name__}: {e}")
+        raise
 
 
 @task(name="sap-buid-query", task_run_name="SAP-{bapi_name}", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
 async def fetch_sap_buid_query_task(query: dict, sap_api_config: dict, bapi_name: str) -> List[str]:
     logger = get_run_logger()
-    logger.info(f"📡 SAP [{bapi_name}] — integrations: {query['integrations']}")
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            sap_api_config["url"],
-            params=query["params"] or None,
-            json=query["json"],
-            headers=sap_api_config["headers"],
-            timeout=30,
-        )
-        if resp.is_error:
-            logger.error(f"❌ SAP [{bapi_name}] {resp.status_code}: {resp.text}")
-        resp.raise_for_status()
-        rows = resp.json().get("ET_EMP_LIST", [])
-    buids = [row.get("BUID") for row in rows if row.get("EMP_STATUS") == "3 - Active" and row.get("BUID")]
-    logger.info(f"✅ SAP [{bapi_name}]: {len(buids)} BUIDs retrieved")
-    return buids
+    logger.info(f"📡 SAP [{bapi_name}]")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                sap_api_config["url"],
+                params=query.get("params") or None,
+                json=query.get("json") or {},
+                headers=sap_api_config["headers"],
+                timeout=30,
+            )
+            if resp.is_error:
+                logger.error(f"❌ SAP [{bapi_name}] {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
+            rows = resp.json().get("ET_EMP_LIST", [])
+        buids = [row.get("BUID") for row in rows if row.get("EMP_STATUS") == "3 - Active" and row.get("BUID")]
+        logger.info(f"✅ SAP [{bapi_name}]: {len(buids)} BUIDs retrieved")
+        return buids
+    except Exception as e:
+        logger.error(f"❌ SAP [{bapi_name}] failed: {type(e).__name__}: {e}")
+        raise
+
 
 
 
@@ -274,7 +311,7 @@ async def insert_persons_batch_task(
     batch_type: str,
     asyncpg_pool,
     insert_sem: asyncio.Semaphore,
-    metrics: dict
+    metrics: dict,
 ) -> dict:
     logger = get_run_logger()
     insert_batch_start = datetime.now()
@@ -315,7 +352,7 @@ async def insert_persons_batch_task(
                         "SELECT * FROM unnest($1::text[], $2::jsonb[]) AS t(bu_uid, person_data) "
                         "RETURNING bu_uid",
                         [r[0] for r in records],
-                        [r[1] for r in records]
+                        [r[1] for r in records],
                     )
             inserted_buids_set = {row["bu_uid"] for row in result}
             trigger_skipped_buids = sorted(r[0] for r in records if r[0] not in inserted_buids_set)

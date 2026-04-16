@@ -20,8 +20,7 @@ class Settings(BaseSettings):
     de_person_api_key: str
 
     vds_url: str
-    vds_username: str
-    vds_password: str
+    vds_key: str
 
     sap_url: str
     sap_key: str

@@ -5,8 +5,8 @@ import httpx
 from datetime import datetime
 from prefect import flow
 from prefect.logging import get_run_logger
-from config.resources import PostgresResource, DEPersonApiResource, CsToolsResource, SAPApiResource
-from flows.person.person_tasks import fetch_ps_buid_query_task, fetch_sap_buid_query_task, query_all_buids_task, process_uidCarTerms_batch_task, process_buids_batch_task, insert_persons_batch_task
+from config.resources import PostgresResource, DEPersonApiResource, CsToolsResource, SAPApiResource, VDSApiResource
+from flows.person.person_tasks import fetch_ps_buid_query_task, fetch_vds_buid_query_task, fetch_sap_buid_query_task, query_all_buids_task, process_uidCarTerms_batch_task, process_buids_batch_task, insert_persons_batch_task
 from flows.person.person_tasks import _QUERIES_PATH
 
 # Non-serializable shared state for inline subflows (same process/event loop).
@@ -18,15 +18,18 @@ _batch_context: dict = {}
 async def fetch_buids_subflow(
     cstools_config: dict,
     sap_api_config: dict,
+    vds_api_config: dict,
 ) -> list:
     logger = get_run_logger()
     with open(_QUERIES_PATH, "rb") as f:
         queries = tomllib.load(f)
-    ps_queries = queries["PSQueries"]
-    sap_queries = queries["SAPQueries"]
+    ps_queries = queries.get("PSQueries", [])
+    sap_queries = queries.get("SAPQueries", [])
+    vds_queries = queries.get("VDSQueries", [])
 
     ps_sem = asyncio.Semaphore(5)
     sap_sem = asyncio.Semaphore(5)
+    vds_sem = asyncio.Semaphore(5)
 
     async def run_ps(query):
         async with ps_sem:
@@ -36,16 +39,27 @@ async def fetch_buids_subflow(
         async with sap_sem:
             return await fetch_sap_buid_query_task(query, sap_api_config, query["params"].get("BAPIName", "unknown"))
 
+    async def run_vds(query, idx):
+        async with vds_sem:
+            return await fetch_vds_buid_query_task(query, vds_api_config, f"VDS-{idx}")
+
     results = await asyncio.gather(
         *[run_ps(q) for q in ps_queries],
         *[run_sap(q) for q in sap_queries],
+        *[run_vds(q, i) for i, q in enumerate(vds_queries)],
         return_exceptions=True,
     )
 
     all_buids = []
+    total = len(ps_queries) + len(sap_queries) + len(vds_queries)
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            label = f"PSQuery {i}" if i < len(ps_queries) else f"SAP query {i - len(ps_queries)}"
+            if i < len(ps_queries):
+                label = f"PSQuery {i}"
+            elif i < len(ps_queries) + len(sap_queries):
+                label = f"SAP query {i - len(ps_queries)}"
+            else:
+                label = f"VDS query {i - len(ps_queries) - len(sap_queries)}"
             logger.error(f"❌ {label} failed: {type(result).__name__}: {result}")
         else:
             all_buids.extend(result)
@@ -167,6 +181,7 @@ async def person_raw_flow(
     person_api_config = DEPersonApiResource.get_config()
     cstools_config = CsToolsResource.get_config()
     sap_api_config = SAPApiResource.get_config()
+    vds_api_config = VDSApiResource.get_config()
 
     start_time = datetime.now()
     metrics = {
@@ -257,8 +272,7 @@ async def person_raw_flow(
 
     # Phase 1: Fetch BUIDs (concurrent)
     #TODO: Fetch ENS population too, or call EVERY Population.
-    #TODO: Re-enable VDS BUID fetch after new credentials are set up
-    buids = await fetch_buids_subflow(cstools_config, sap_api_config)
+    buids = await fetch_buids_subflow(cstools_config, sap_api_config, vds_api_config)
     phase_info["total_buids"] = len(buids)
 
     #TODO: Any failed BUIDs will go into the person_live_update queue for reprocessing

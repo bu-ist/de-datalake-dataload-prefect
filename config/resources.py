@@ -1,5 +1,4 @@
 import asyncpg
-import base64
 from typing import Dict
 from config.settings import settings
 
@@ -60,13 +59,11 @@ class CsToolsResource:
 class VDSApiResource:
     @staticmethod
     def get_config() -> Dict[str, any]:
-        auth_string = f"{settings.vds_username}:{settings.vds_password}"
-        encoded_auth = base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
-
+        #TODO: Replace Bearer token with proper API key auth once VDS credentials are finalized
         return {
             "url": settings.vds_url,
             "headers": {
-                "Authorization": f"Basic {encoded_auth}",
+                "Authorization": f"Bearer {settings.vds_key}",
                 "User-Agent": "Mozilla/5.0"
             }
         }
