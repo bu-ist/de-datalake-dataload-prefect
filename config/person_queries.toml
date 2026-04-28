@@ -10,4 +10,7 @@ params = {BAPIName = "Z_HR_EMPLOYEE_OBJ_LIST", account = "HR"}
 
 
 [[VDSQueries]]
-json = {params = "filter=(%26(AffiliateAssignmentEndDate=*)(%26(!(PersonPrimaryAffiliation=staff))(!(PersonPrimaryAffiliation=faculty))))&sizeLimit=25000"}
+json = {params = "filter=(PersonPrimaryAffiliation=faculty)&sizeLimit=25000"}
+
+[[VDSQueries]]
+json = {params = "filter=(PersonPrimaryAffiliation=staff)&sizeLimit=25000"}

@@ -15,7 +15,7 @@ _QUERIES_PATH = Path(__file__).resolve().parents[2] / "config" / "person_queries
 @task(name="ps-buid-query", task_run_name="PSQuery-{query_name}", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
 async def fetch_ps_buid_query_task(query: dict, cstools_config: dict, query_name: str) -> List[str]:
     logger = get_run_logger()
-    logger.info(f"📡 PSQuery [{query_name}]")
+    logger.info(f"📡 PSQuery [{query_name}] — integrations: {query.get('integrations', [])}")
     try:
         async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
             resp = await client.post(
@@ -68,7 +68,7 @@ async def fetch_vds_buid_query_task(query: dict, vds_api_config: dict, query_nam
 @task(name="sap-buid-query", task_run_name="SAP-{bapi_name}", retries=2, retry_delay_seconds=30, tags=["fetch-buids"])
 async def fetch_sap_buid_query_task(query: dict, sap_api_config: dict, bapi_name: str) -> List[str]:
     logger = get_run_logger()
-    logger.info(f"📡 SAP [{bapi_name}]")
+    logger.info(f"📡 SAP [{bapi_name}] — integrations: {query.get('integrations', [])}")
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -90,91 +90,175 @@ async def fetch_sap_buid_query_task(query: dict, sap_api_config: dict, bapi_name
         raise
 
 
-
-
-async def query_cs_single(
+async def _query_student_single(
     buid: str,
     cs_client: httpx.AsyncClient,
     cstools_config: dict,
     cs_sem: asyncio.Semaphore,
     metrics: dict,
     logger,
-    uidCarTerms: list,
-    buids_only: list,
-    uidCarTerms_threshold_event: asyncio.Event,
-    buids_threshold_event: asyncio.Event,
-    uidcarterm_batch_size: int,
-    buid_batch_size: int,
-) -> None:
+) -> list:
     async with cs_sem:
-        metrics["cs_queried"] += 1
+        metrics["student_cs_queried"] += 1
         for attempt in range(1, 6):
             try:
                 payload = {"query_name": "BU_TERM_STD_FULL_TERM", "prompt_names": ["BUID"], "prompt_values": [buid]}
                 resp = await cs_client.post(cstools_config["url"], json=payload, headers=cstools_config["headers"], timeout=30)
                 if resp.is_error:
-                    logger.error(f"❌ CS Tools [{buid}] {resp.status_code}: {resp.text}")
+                    logger.error(f"❌ CS Tools [student/{buid}] {resp.status_code}: {resp.text}")
                 resp.raise_for_status()
-                uidCarTerm = resp.json().get('data', [])
-
-                #TODO: Add logic for Faculty Terms. Consider if buid is a student and faculty for Terms
-
-                if uidCarTerm:
-                    metrics["cs_success"] += 1
-                    metrics["uidcarterm_total"] += len(uidCarTerm)
-                    uidCarTerms.append(uidCarTerm)
-                    if len([item for row in uidCarTerms for item in row]) >= uidcarterm_batch_size:
-                        uidCarTerms_threshold_event.set()
+                terms = resp.json().get("data", [])
+                if terms:
+                    metrics["student_cs_success"] += 1
+                    metrics["student_term_total"] += len(terms)
                 else:
-                    metrics["cs_empty"] += 1
-                    metrics["buids_only_count"] += 1
-                    buids_only.append(buid)
-                    if len(buids_only) >= buid_batch_size:
-                        buids_threshold_event.set()
-                return
+                    metrics["student_cs_empty"] += 1
+                return terms
             except Exception as e:
                 if attempt < 5:
                     await asyncio.sleep(10 * 3 ** (attempt - 1))
                 else:
-                    metrics["errors"]["cs"] += 1
-                    logger.error(f"❌ CS Tools query failed for BUID {buid} after {attempt} attempts: {type(e).__name__}: {e}")
-                    return
+                    metrics["errors"]["cs_student"] += 1
+                    logger.error(f"❌ CS Tools [student/{buid}] failed after {attempt} attempts: {type(e).__name__}: {e}")
+                    metrics["student_cs_empty"] += 1
+                    return []
 
 
-@task(name="query-all-buids-from-cs-tools", retries=1, retry_delay_seconds=30, cache_policy=NO_CACHE, tags=["query-buid-terms"])
-async def query_all_buids_task(
-    buids: List[str],
+async def _query_faculty_single(
+    buid: str,
     cs_client: httpx.AsyncClient,
     cstools_config: dict,
     cs_sem: asyncio.Semaphore,
     metrics: dict,
-    uidCarTerms: list,
+    logger,
+) -> list:
+    async with cs_sem:
+        metrics["faculty_cs_queried"] += 1
+        for attempt in range(1, 6):
+            try:
+                payload = {"query_name": "BU_FACULTY_GET", "prompt_names": ["EMPLID"], "prompt_values": [buid]}
+                resp = await cs_client.post(cstools_config["url"], json=payload, headers=cstools_config["headers"], timeout=30)
+                if resp.is_error:
+                    logger.error(f"❌ CS Tools [faculty/{buid}] {resp.status_code}: {resp.text}")
+                resp.raise_for_status()
+                terms = resp.json().get("data", [])
+                if terms:
+                    metrics["faculty_cs_success"] += 1
+                    metrics["faculty_term_total"] += len(terms)
+                else:
+                    metrics["faculty_cs_empty"] += 1
+                return terms
+            except Exception as e:
+                if attempt < 5:
+                    await asyncio.sleep(10 * 3 ** (attempt - 1))
+                else:
+                    metrics["errors"]["cs_faculty"] += 1
+                    logger.error(f"❌ CS Tools [faculty/{buid}] failed after {attempt} attempts: {type(e).__name__}: {e}")
+                    metrics["faculty_cs_empty"] += 1
+                    return []
+
+
+def _finalize_buid(
+    buid: str,
+    buid_expected: dict,
+    buid_done: dict,
+    student_results: dict,
+    faculty_results: dict,
+    metrics: dict,
+    term_buids: list,
     buids_only: list,
-    uidCarTerms_threshold_event: asyncio.Event,
+    term_buids_threshold_event: asyncio.Event,
     buids_threshold_event: asyncio.Event,
-    uidcarterm_batch_size: int,
+    term_batch_size: int,
+    buid_batch_size: int,
+) -> None:
+    """Route a BUID once all its expected CS queries have completed. No await points — safe under asyncio."""
+    buid_done[buid] += 1
+    if buid_done[buid] < buid_expected[buid]:
+        return
+    st = student_results.get(buid, [])
+    ft = faculty_results.get(buid, [])
+    if st or ft:
+        term_buids.append({"buid": buid, "student_terms": st, "faculty_terms": ft})
+        if sum(len(e["student_terms"]) + len(e["faculty_terms"]) for e in term_buids) >= term_batch_size:
+            term_buids_threshold_event.set()
+    else:
+        metrics["buids_only_count"] += 1
+        buids_only.append(buid)
+        if len(buids_only) >= buid_batch_size:
+            buids_threshold_event.set()
+
+
+@task(name="query-student-terms", retries=1, retry_delay_seconds=30, cache_policy=NO_CACHE, tags=["query-buid-terms"])
+async def query_student_terms_task(
+    student_buids: List[str],
+    buid_expected: dict,
+    buid_done: dict,
+    student_results: dict,
+    faculty_results: dict,
+    cs_client: httpx.AsyncClient,
+    cstools_config: dict,
+    cs_sem: asyncio.Semaphore,
+    metrics: dict,
+    term_buids: list,
+    buids_only: list,
+    term_buids_threshold_event: asyncio.Event,
+    buids_threshold_event: asyncio.Event,
+    term_batch_size: int,
     buid_batch_size: int,
 ) -> None:
     logger = get_run_logger()
-    logger.info(f"⏳ Starting CS Tools queries for {len(buids)} BUIDs...")
-    await asyncio.gather(
-        *(query_cs_single(
-            buid=buid,
-            cs_client=cs_client,
-            cstools_config=cstools_config,
-            cs_sem=cs_sem,
-            metrics=metrics,
-            logger=logger,
-            uidCarTerms=uidCarTerms,
-            buids_only=buids_only,
-            uidCarTerms_threshold_event=uidCarTerms_threshold_event,
-            buids_threshold_event=buids_threshold_event,
-            uidcarterm_batch_size=uidcarterm_batch_size,
-            buid_batch_size=buid_batch_size,
-        ) for buid in buids),
-        return_exceptions=True
+    logger.info(f"⏳ BU_TERM_STD_FULL_TERM: {len(student_buids):,} student BUIDs")
+
+    async def run(buid: str) -> None:
+        terms = await _query_student_single(buid, cs_client, cstools_config, cs_sem, metrics, logger)
+        student_results[buid] = terms
+        _finalize_buid(buid, buid_expected, buid_done, student_results, faculty_results, metrics,
+                       term_buids, buids_only, term_buids_threshold_event, buids_threshold_event,
+                       term_batch_size, buid_batch_size)
+
+    await asyncio.gather(*[run(b) for b in student_buids], return_exceptions=True)
+    logger.info(
+        f"✅ BU_TERM_STD_FULL_TERM complete: "
+        f"{metrics['student_cs_success']:,} with terms ({metrics['student_term_total']:,} records), "
+        f"{metrics['student_cs_empty']:,} empty, {metrics['errors']['cs_student']} errors"
     )
-    logger.info(f"✅ CS Tools complete: {metrics['cs_success']} successful, {metrics['cs_empty']} empty, {metrics['errors']['cs']} errors")
+
+
+@task(name="query-faculty-terms", retries=1, retry_delay_seconds=30, cache_policy=NO_CACHE, tags=["query-buid-terms"])
+async def query_faculty_terms_task(
+    faculty_buids: List[str],
+    buid_expected: dict,
+    buid_done: dict,
+    student_results: dict,
+    faculty_results: dict,
+    cs_client: httpx.AsyncClient,
+    cstools_config: dict,
+    cs_sem: asyncio.Semaphore,
+    metrics: dict,
+    term_buids: list,
+    buids_only: list,
+    term_buids_threshold_event: asyncio.Event,
+    buids_threshold_event: asyncio.Event,
+    term_batch_size: int,
+    buid_batch_size: int,
+) -> None:
+    logger = get_run_logger()
+    logger.info(f"⏳ BU_FACULTY_GET: {len(faculty_buids):,} faculty BUIDs")
+
+    async def run(buid: str) -> None:
+        terms = await _query_faculty_single(buid, cs_client, cstools_config, cs_sem, metrics, logger)
+        faculty_results[buid] = terms
+        _finalize_buid(buid, buid_expected, buid_done, student_results, faculty_results, metrics,
+                       term_buids, buids_only, term_buids_threshold_event, buids_threshold_event,
+                       term_batch_size, buid_batch_size)
+
+    await asyncio.gather(*[run(b) for b in faculty_buids], return_exceptions=True)
+    logger.info(
+        f"✅ BU_FACULTY_GET complete: "
+        f"{metrics['faculty_cs_success']:,} with terms ({metrics['faculty_term_total']:,} records), "
+        f"{metrics['faculty_cs_empty']:,} empty, {metrics['errors']['cs_faculty']} errors"
+    )
 
 
 @task(
@@ -186,7 +270,7 @@ async def query_all_buids_task(
     tags=["get-person-batch"]
 )
 async def process_uidCarTerms_batch_task(
-    batch: List[List[dict]],
+    batch: List[dict],
     batch_id: int,
     person_api_client: httpx.AsyncClient,
     person_api_config: dict,
@@ -194,41 +278,56 @@ async def process_uidCarTerms_batch_task(
     metrics: dict
 ) -> List[dict]:
     logger = get_run_logger()
-    flattened = [item for row in batch for item in row]
-    if not flattened:
+    if not batch:
         logger.info(f"📦 Batch {batch_id}: Empty - skipping")
         return []
 
-    unique_buids = set(item.get("CAMPUS_ID") for item in flattened if item.get("CAMPUS_ID"))
-    num_terms = len(flattened)
-    num_students = len(unique_buids)
+    uid_car_term_data = []
+    emplid_term_data = []
+    buid_summary_parts = []
 
-    buid_car_terms: dict = {}
-    for item in flattened:
-        buid = item.get("CAMPUS_ID", "?")
-        career = item.get("ACAD_CAREER", "?")
-        term = str(item.get("STRM", "?"))
-        buid_car_terms.setdefault(buid, []).append(f"{{{career}, {term}}}")
-    buid_summary = "\n  ".join(
-        f"{buid}: [{', '.join(pairs)}]"
-        for buid, pairs in sorted(buid_car_terms.items())
-    )
-    uid_car_term_data = [
-        {("buid" if k=="CAMPUS_ID" else k.lower()): v for k, v in item.items() if k != "attr:rownumber"}
-        for item in flattened
-    ]
-    payload = {"objects": ["student", "affiliate", "faculty", "employee"], "student": {"uid_car_term": uid_car_term_data}, "options": {"response_format": "ndjson", "batch_size": num_terms + 1}}
+    for entry in batch:
+        buid = entry["buid"]
+        student_terms = entry.get("student_terms", [])
+        faculty_terms = entry.get("faculty_terms", [])
+
+        for t in student_terms:
+            uid_car_term_data.append(
+                {("buid" if k == "CAMPUS_ID" else k.lower()): v for k, v in t.items() if k != "attr:rownumber"}
+            )
+        for t in faculty_terms:
+            emplid_term_data.append({"emplid": t.get("EMPLID", buid), "strm": str(t.get("STRM", ""))})
+
+        pairs = [f"{{{t.get('ACAD_CAREER', '?')}, {t.get('STRM')}}}" for t in student_terms] + \
+                [f"{{faculty, {t.get('STRM')}}}" for t in faculty_terms]
+        buid_summary_parts.append(f"{buid}: [{', '.join(pairs)}]")
+
+    num_buids = len(batch)
+    num_terms = len(uid_car_term_data) + len(emplid_term_data)
+    buid_summary = "\n  ".join(buid_summary_parts)
+
+    payload: dict = {
+        "objects": ["student", "affiliate", "faculty", "employee"],
+        "options": {"response_format": "ndjson", "batch_size": num_terms + 1},
+    }
+    if uid_car_term_data:
+        payload["student"] = {"uid_car_term": uid_car_term_data}
+    if emplid_term_data:
+        payload["faculty"] = {"emplid_term": emplid_term_data}
 
     async with person_api_sem:
         metrics["uidcarterm_batches_sent"] += 1
-        logger.info(f"📦 Batch {batch_id} [Students]: {num_students} BUIDs, {num_terms} terms\n  {buid_summary}")
+        logger.info(
+            f"📦 Batch {batch_id} [Terms]: {num_buids} BUIDs, "
+            f"{len(uid_car_term_data)} student terms, {len(emplid_term_data)} faculty terms\n  {buid_summary}"
+        )
         api_start = datetime.now()
         persons = []
         #TODO: Person API takes about 5 minutes to finish. Timeout after 11 minutes. Log any buids that failed or insert them into queue to redo (live updates queue)
         async with person_api_client.stream("POST", person_api_config["url"], json=payload, timeout=1200) as resp:
             if resp.is_error:
                 await resp.aread()
-                logger.error(f"❌ Person API batch {batch_id} [Students] {resp.status_code}: {resp.text}")
+                logger.error(f"❌ Person API batch {batch_id} [Terms] {resp.status_code}: {resp.text}")
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line.strip():
@@ -242,7 +341,7 @@ async def process_uidCarTerms_batch_task(
         metrics["persons_received"] += len(persons)
         metrics["uidcarterm_batches_completed"] += 1
 
-        logger.info(f"✅ Batch {batch_id} [Students]: {len(persons)} persons in {api_duration:.1f}s")
+        logger.info(f"✅ Batch {batch_id} [Terms]: {len(persons)} persons in {api_duration:.1f}s")
         return persons
 
 
