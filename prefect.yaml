@@ -13,6 +13,7 @@ deployments:
     tags: ["raw", "term", "peoplesoft"]
     description: "Daily term data load at 1:00 AM ET"
     entrypoint: flows/term/term_flow.py:term_raw_flow
+    concurrency_limit: 1
     work_pool:
       name: k8s-pool
     schedules:
@@ -24,6 +25,7 @@ deployments:
     tags: ["raw", "course", "snaplogic"]
     description: "Daily course data load at 2:00 AM ET"
     entrypoint: flows/course/course_flow.py:course_raw_flow
+    concurrency_limit: 1
     work_pool:
       name: k8s-pool
     schedules:
@@ -35,6 +37,7 @@ deployments:
     tags: ["raw", "person", "snaplogic"]
     description: "Daily person data load at 3:00 AM ET"
     entrypoint: flows/person/person_flow.py:person_raw_flow
+    concurrency_limit: 1
     work_pool:
       name: k8s-pool
     schedules:

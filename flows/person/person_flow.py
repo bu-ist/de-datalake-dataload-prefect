@@ -1,12 +1,14 @@
 import asyncio
 import math
+import re
 import tomllib
 import httpx
 from datetime import datetime
 from prefect import flow
+from prefect.exceptions import Abort
 from prefect.logging import get_run_logger
 from config.resources import PostgresResource, DEPersonApiResource, CsToolsResource, SAPApiResource, VDSApiResource
-from flows.person.person_tasks import fetch_ps_buid_query_task, fetch_vds_buid_query_task, fetch_sap_buid_query_task, query_all_buids_task, process_uidCarTerms_batch_task, process_buids_batch_task, insert_persons_batch_task
+from flows.person.person_tasks import fetch_ps_buid_query_task, fetch_vds_buid_query_task, fetch_sap_buid_query_task, query_student_terms_task, query_faculty_terms_task, process_uidCarTerms_batch_task, process_buids_batch_task, insert_persons_batch_task
 from flows.person.person_tasks import _QUERIES_PATH
 
 # Non-serializable shared state for inline subflows (same process/event loop).
@@ -14,12 +16,18 @@ from flows.person.person_tasks import _QUERIES_PATH
 _batch_context: dict = {}
 
 
+def _vds_affiliation(query: dict, idx: int) -> str:
+    params = query.get("json", {}).get("params", "")
+    m = re.search(r"PersonPrimaryAffiliation=(\w+)", params)
+    return m.group(1) if m else f"vds-{idx}"
+
+
 @flow(name="fetch-buids", log_prints=True)
 async def fetch_buids_subflow(
     cstools_config: dict,
     sap_api_config: dict,
     vds_api_config: dict,
-) -> list:
+) -> tuple:
     logger = get_run_logger()
     with open(_QUERIES_PATH, "rb") as f:
         queries = tomllib.load(f)
@@ -41,32 +49,69 @@ async def fetch_buids_subflow(
 
     async def run_vds(query, idx):
         async with vds_sem:
-            return await fetch_vds_buid_query_task(query, vds_api_config, f"VDS-{idx}")
+            return await fetch_vds_buid_query_task(query, vds_api_config, _vds_affiliation(query, idx))
 
-    results = await asyncio.gather(
-        *[run_ps(q) for q in ps_queries],
-        *[run_sap(q) for q in sap_queries],
-        *[run_vds(q, i) for i, q in enumerate(vds_queries)],
-        return_exceptions=True,
+    ps_results, sap_results, vds_results = await asyncio.gather(
+        asyncio.gather(*[run_ps(q) for q in ps_queries], return_exceptions=True),
+        asyncio.gather(*[run_sap(q) for q in sap_queries], return_exceptions=True),
+        asyncio.gather(*[run_vds(q, i) for i, q in enumerate(vds_queries)], return_exceptions=True),
     )
 
-    all_buids = []
-    total = len(ps_queries) + len(sap_queries) + len(vds_queries)
-    for i, result in enumerate(results):
+    bad = []
+    for i, result in enumerate(ps_results):
+        name = ps_queries[i].get("json", {}).get("query_name", f"ps-{i}")
         if isinstance(result, Exception):
-            if i < len(ps_queries):
-                label = f"PSQuery {i}"
-            elif i < len(ps_queries) + len(sap_queries):
-                label = f"SAP query {i - len(ps_queries)}"
-            else:
-                label = f"VDS query {i - len(ps_queries) - len(sap_queries)}"
-            logger.error(f"❌ {label} failed: {type(result).__name__}: {result}")
-        else:
-            all_buids.extend(result)
+            bad.append(f"PSQuery [{name}]: {type(result).__name__}: {result}")
+        elif not result:
+            bad.append(f"PSQuery [{name}]: returned 0 BUIDs")
 
-    buids = list(set(all_buids))
-    logger.info(f"✅ {len(buids):,} unique BUIDs: [{', '.join(sorted(buids))}]")
-    return buids
+    for i, result in enumerate(sap_results):
+        name = sap_queries[i].get("params", {}).get("BAPIName", f"sap-{i}")
+        if isinstance(result, Exception):
+            bad.append(f"SAP [{name}]: {type(result).__name__}: {result}")
+        elif not result:
+            bad.append(f"SAP [{name}]: returned 0 BUIDs")
+
+    for i, result in enumerate(vds_results):
+        affiliation = _vds_affiliation(vds_queries[i], i)
+        if isinstance(result, Exception):
+            bad.append(f"VDS [{affiliation}]: {type(result).__name__}: {result}")
+        elif not result:
+            bad.append(f"VDS [{affiliation}]: returned 0 BUIDs")
+
+    if bad:
+        for msg in bad:
+            logger.error(f"❌ {msg}")
+        logger.error(f"🚫 Cancelling run: {len(bad)} BUID source(s) failed or returned empty")
+        raise Abort()
+
+    student_buid_set: set = set()
+    faculty_buid_set: set = set()
+    no_cs_buid_set: set = set()
+
+    for result in ps_results:
+        student_buid_set.update(result)
+
+    for result in sap_results:
+        no_cs_buid_set.update(result)
+
+    for i, result in enumerate(vds_results):
+        affiliation = _vds_affiliation(vds_queries[i], i)
+        if affiliation == "faculty":
+            faculty_buid_set.update(result)
+        else:
+            no_cs_buid_set.update(result)
+
+    all_buids = list(student_buid_set | faculty_buid_set | no_cs_buid_set)
+    n_both = len(student_buid_set & faculty_buid_set)
+    n_no_cs_only = len(no_cs_buid_set - student_buid_set - faculty_buid_set)
+    logger.info(
+        f"✅ {len(all_buids):,} unique BUIDs"
+        f"\n   Students (PS):           {len(student_buid_set):,}"
+        f"\n   Faculty (VDS):           {len(faculty_buid_set):,}  ({n_both:,} also students)"
+        f"\n   Staff/Employees (no CS): {n_no_cs_only:,}"
+    )
+    return all_buids, student_buid_set, faculty_buid_set, no_cs_buid_set
 
 
 @flow(name="person-api-batches", log_prints=True)
@@ -77,7 +122,6 @@ async def person_batches_subflow(
     """
     Consumes person API batches from the shared queue as they are produced by the
     CS Tools query pipeline, concurrently calling the Person API.
-    Runs alongside query_all_buids_task — starts immediately and waits for work.
     Results are pushed to the insert_queue for person_inserts_subflow.
     """
     logger = get_run_logger()
@@ -97,7 +141,7 @@ async def person_batches_subflow(
             batch_type, batch_data, batch_id = batch_item
             try:
                 persons = []
-                if batch_type == "uidcarterms":
+                if batch_type == "terms":
                     persons = await process_uidCarTerms_batch_task(
                         batch=batch_data,
                         batch_id=batch_id,
@@ -185,10 +229,14 @@ async def person_raw_flow(
 
     start_time = datetime.now()
     metrics = {
-        "cs_queried": 0,
-        "cs_success": 0,
-        "cs_empty": 0,
-        "uidcarterm_total": 0,
+        "student_cs_queried": 0,
+        "student_cs_success": 0,
+        "student_cs_empty": 0,
+        "student_term_total": 0,
+        "faculty_cs_queried": 0,
+        "faculty_cs_success": 0,
+        "faculty_cs_empty": 0,
+        "faculty_term_total": 0,
         "buids_only_count": 0,
         "uidcarterm_batches_sent": 0,
         "uidcarterm_batches_completed": 0,
@@ -197,10 +245,10 @@ async def person_raw_flow(
         "persons_received": 0,
         "insert_success": 0,
         "insert_skipped": 0,
-        "errors": {"cs": 0, "person_api": 0, "db": 0},
+        "errors": {"cs_student": 0, "cs_faculty": 0, "person_api": 0, "db": 0},
         "done": False,
     }
-    phase_info = {"total_buids": 0}
+    phase_info = {"total_buids": 0, "n_student": 0, "n_faculty": 0}
 
     async def monitor_progress(interval: int = 15) -> None:
         last_valid_total_runtime = None
@@ -208,60 +256,76 @@ async def person_raw_flow(
             while not metrics["done"]:
                 elapsed = (datetime.now() - start_time).total_seconds()
                 elapsed_str = f"{int(elapsed//3600):02}:{int((elapsed%3600)//60):02}:{int(elapsed%60):02}"
-                cs_done = metrics["cs_queried"]
-                total_buids_known = phase_info["total_buids"]
-                progress = cs_done / total_buids_known if total_buids_known else 0
+
+                n_student = phase_info["n_student"]
+                n_faculty = phase_info["n_faculty"]
+                s_done = metrics["student_cs_queried"]
+                f_done = metrics["faculty_cs_queried"]
+                total_cs_done = s_done + f_done
+                n_cs_total = n_student + n_faculty
                 total_batches_completed = metrics["uidcarterm_batches_completed"] + metrics["buid_batches_completed"]
 
-                if cs_done >= total_buids_known and total_buids_known > 0:
-                    est_term_batches = batch_counter["uidcarterms"]
-                    est_buid_batches = batch_counter["buids"]
-                    est_batches_total = est_term_batches + est_buid_batches
-                elif cs_done > 0:
-                    avg_terms_per_student = metrics["uidcarterm_total"] / metrics["cs_success"] if metrics["cs_success"] > 0 else 0
-                    frac_with_terms = metrics["cs_success"] / cs_done
-                    remaining_buids = total_buids_known - cs_done
-                    est_total_terms = metrics["uidcarterm_total"] + int(remaining_buids * frac_with_terms * avg_terms_per_student)
+                # ETA estimation
+                if total_cs_done >= n_cs_total and n_cs_total > 0:
+                    try:
+                        est_term_batches = batch_counter["uidcarterms"]
+                        est_buid_batches = batch_counter["buids"]
+                    except (NameError, KeyError):
+                        est_term_batches = 0
+                        est_buid_batches = 0
+                elif total_cs_done > 0:
+                    total_terms = metrics["student_term_total"] + metrics["faculty_term_total"]
+                    cs_with_terms = metrics["student_cs_success"] + metrics["faculty_cs_success"]
+                    avg_terms = total_terms / cs_with_terms if cs_with_terms > 0 else 0
+                    frac_with_terms = cs_with_terms / total_cs_done
+                    remaining_cs = n_cs_total - total_cs_done
+                    est_total_terms = total_terms + int(remaining_cs * frac_with_terms * avg_terms)
                     est_term_batches = math.ceil(est_total_terms / uidcarterm_batch_size) if est_total_terms > 0 else 0
-                    est_total_buids_without_terms = int((metrics["cs_empty"] / cs_done) * total_buids_known)
-                    est_buid_batches = math.ceil(est_total_buids_without_terms / buid_batch_size) if est_total_buids_without_terms > 0 else 0
-                    est_batches_total = est_term_batches + est_buid_batches
+                    cs_no_terms = metrics["student_cs_empty"] + metrics["faculty_cs_empty"]
+                    est_total_buids_only = metrics["buids_only_count"] + int(remaining_cs * (cs_no_terms / total_cs_done))
+                    est_buid_batches = math.ceil(est_total_buids_only / buid_batch_size) if est_total_buids_only > 0 else 0
                 else:
                     est_term_batches = 0
                     est_buid_batches = 0
-                    est_batches_total = 1
 
+                est_batches_total = est_term_batches + est_buid_batches
                 total_estimated_runtime = None
                 if total_batches_completed > 0:
                     remaining_batches = max(est_batches_total - total_batches_completed, 0)
                     avg_batch_time = elapsed / max(total_batches_completed, 1)
                     total_estimated_runtime = elapsed + avg_batch_time * remaining_batches
                     last_valid_total_runtime = total_estimated_runtime
-
                 if total_estimated_runtime is None and last_valid_total_runtime is not None:
                     total_estimated_runtime = last_valid_total_runtime
 
-                eta_str = f"{int(total_estimated_runtime//3600):02}:{int((total_estimated_runtime%3600)//60):02}:{int(total_estimated_runtime%60):02}" if total_estimated_runtime is not None else "N/A"
+                eta_str = (
+                    f"{int(total_estimated_runtime//3600):02}:{int((total_estimated_runtime%3600)//60):02}:{int(total_estimated_runtime%60):02}"
+                    if total_estimated_runtime is not None else "N/A"
+                )
+
+                def pct(done, total):
+                    return f"{done*100/total:>5.1f}%" if total else "  N/A "
+
                 logger.info(
                     f"╔═══════════════════════════════════════════════════════════════════╗"
                     f"\n║ HEARTBEAT [{elapsed_str}] — ETA: {eta_str}"
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ DATA COLLECTION                                                   "
-                    f"\n║   CS Tools Queries: {cs_done:>6,} / {total_buids_known:<6,} ({progress*100:>5.1f}%)"
-                    f"\n║     └─ With Terms:    {metrics['cs_success']:>6,} students → {metrics['uidcarterm_total']:>6,} term records"
-                    f"\n║     └─ Without Terms: {metrics['cs_empty']:>6,} people (BUID only)"
+                    f"\n║   BU_TERM_STD_FULL_TERM [students]: {s_done:>6,} / {n_student:<6,} ({pct(s_done, n_student)}) → {metrics['student_term_total']:,} terms"
+                    f"\n║   BU_FACULTY_GET        [faculty]:  {f_done:>6,} / {n_faculty:<6,} ({pct(f_done, n_faculty)}) → {metrics['faculty_term_total']:,} terms"
+                    f"\n║   BUID-only (staff / emp / no terms): {metrics['buids_only_count']:,}"
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ API BATCHES (Person API)                                          "
-                    f"\n║   Student Batches:    {metrics['uidcarterm_batches_completed']:>3} / {est_term_batches:<3} completed"
-                    f"\n║   BUID Batches:       {metrics['buid_batches_completed']:>3} / {est_buid_batches:<3} completed"
-                    f"\n║   Total:              {total_batches_completed:>3} / {est_batches_total:<3} completed"
+                    f"\n║   Term Batches:    {metrics['uidcarterm_batches_completed']:>3} / {est_term_batches:<3} completed"
+                    f"\n║   BUID Batches:    {metrics['buid_batches_completed']:>3} / {est_buid_batches:<3} completed"
+                    f"\n║   Total:           {total_batches_completed:>3} / {est_batches_total:<3} completed"
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
                     f"\n║ DATABASE OPERATIONS                                               "
                     f"\n║   Persons Received:   {metrics['persons_received']:>6,}"
                     f"\n║   Inserted:           {metrics['insert_success']:>6,} records"
                     f"\n║   Skipped:            {metrics['insert_skipped']:>6,} records"
                     f"\n╠═══════════════════════════════════════════════════════════════════╣"
-                    f"\n║   Errors:             CS={metrics['errors']['cs']}  API={metrics['errors']['person_api']}  DB={metrics['errors']['db']}"
+                    f"\n║   Errors: CS-Student={metrics['errors']['cs_student']}  CS-Faculty={metrics['errors']['cs_faculty']}  API={metrics['errors']['person_api']}  DB={metrics['errors']['db']}"
                     f"\n╚═══════════════════════════════════════════════════════════════════╝"
                 )
                 await asyncio.sleep(interval)
@@ -272,8 +336,13 @@ async def person_raw_flow(
 
     # Phase 1: Fetch BUIDs (concurrent)
     #TODO: Fetch ENS population too, or call EVERY Population.
-    buids = await fetch_buids_subflow(cstools_config, sap_api_config, vds_api_config)
-    phase_info["total_buids"] = len(buids)
+    buids, student_buid_set, faculty_buid_set, no_cs_buid_set = await fetch_buids_subflow(cstools_config, sap_api_config, vds_api_config)
+    no_cs_buids = [b for b in buids if b not in student_buid_set and b not in faculty_buid_set]
+    phase_info.update({
+        "total_buids": len(buids),
+        "n_student": len(student_buid_set),
+        "n_faculty": len(faculty_buid_set),
+    })
 
     #TODO: Any failed BUIDs will go into the person_live_update queue for reprocessing
 
@@ -283,6 +352,9 @@ async def person_raw_flow(
     queue: asyncio.Queue = asyncio.Queue()
     insert_queue: asyncio.Queue = asyncio.Queue()
     first_insert_event = asyncio.Event()
+    # On retry, lazily-set task handles survive in _batch_context — pop them so fresh consumers are created.
+    _batch_context.pop("batches_task", None)
+    _batch_context.pop("inserts_task", None)
     _batch_context.update({
         "queue": queue,
         "insert_queue": insert_queue,
@@ -294,42 +366,58 @@ async def person_raw_flow(
         "metrics": metrics,
     })
 
-    uidCarTerms: list = []
+    term_buids: list = []
     buids_only: list = []
-    uidCarTerms_threshold_event = asyncio.Event()
+    term_buids_threshold_event = asyncio.Event()
     buids_threshold_event = asyncio.Event()
     all_cs_done = asyncio.Event()
-    batch_counter = {"uidcarterms": 0, "buids": 0}
+    batch_counter = {"terms": 0, "buids": 0}
     cs_sem = asyncio.Semaphore(cstools_semaphore_limit)
+
+    # Per-BUID CS query tracking. BUIDs in both sets need both queries to complete
+    # before being routed, so their terms land in a single Person API call.
+    buid_expected = {
+        b: (1 if b in student_buid_set else 0) + (1 if b in faculty_buid_set else 0)
+        for b in buids
+        if b in student_buid_set or b in faculty_buid_set
+    }
+    buid_done = {b: 0 for b in buid_expected}
+    student_results: dict = {}
+    faculty_results: dict = {}
 
     async def monitor_batches() -> None:
         """Watches for batch thresholds and pushes ready batches into the queue.
         Starts person_batches_subflow just before the first batch is pushed."""
         while True:
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 [
-                    asyncio.create_task(uidCarTerms_threshold_event.wait()),
+                    asyncio.create_task(term_buids_threshold_event.wait()),
                     asyncio.create_task(buids_threshold_event.wait()),
                     asyncio.create_task(all_cs_done.wait()),
                 ],
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if uidCarTerms_threshold_event.is_set():
-                uidCarTerms_threshold_event.clear()
-                snapshot = uidCarTerms.copy()
-                uidCarTerms.clear()
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if term_buids_threshold_event.is_set():
+                term_buids_threshold_event.clear()
+                snapshot = term_buids.copy()
+                term_buids.clear()
                 if snapshot:
                     if "batches_task" not in _batch_context:
                         _batch_context["batches_task"] = asyncio.create_task(person_batches_subflow(
                             n_workers=person_api_semaphore_limit,
                             person_api_config=person_api_config,
                         ))
-                    batch_counter["uidcarterms"] += 1
-                    await queue.put(("uidcarterms", snapshot, batch_counter["uidcarterms"]))
+                    batch_counter["terms"] += 1
+                    await queue.put(("terms", snapshot, batch_counter["terms"]))
             if buids_threshold_event.is_set():
                 buids_threshold_event.clear()
-                snapshot = buids_only.copy()
-                buids_only.clear()
+                snapshot = buids_only[:buid_batch_size]
+                del buids_only[:buid_batch_size]
+                if len(buids_only) >= buid_batch_size:
+                    buids_threshold_event.set()
                 if snapshot:
                     if "batches_task" not in _batch_context:
                         _batch_context["batches_task"] = asyncio.create_task(person_batches_subflow(
@@ -344,14 +432,14 @@ async def person_raw_flow(
                         n_workers=person_api_semaphore_limit,
                         person_api_config=person_api_config,
                     ))
-                if uidCarTerms:
-                    snapshot = uidCarTerms.copy()
-                    uidCarTerms.clear()
-                    batch_counter["uidcarterms"] += 1
-                    await queue.put(("uidcarterms", snapshot, batch_counter["uidcarterms"]))
-                if buids_only:
-                    snapshot = buids_only.copy()
-                    buids_only.clear()
+                if term_buids:
+                    snapshot = term_buids.copy()
+                    term_buids.clear()
+                    batch_counter["terms"] += 1
+                    await queue.put(("terms", snapshot, batch_counter["terms"]))
+                while buids_only:
+                    snapshot = buids_only[:buid_batch_size]
+                    del buids_only[:buid_batch_size]
                     batch_counter["buids"] += 1
                     await queue.put(("buids", snapshot, batch_counter["buids"]))
                 break
@@ -367,20 +455,51 @@ async def person_raw_flow(
 
     inserts_starter = asyncio.create_task(start_inserts_when_ready())
 
+    # Route staff/employees directly — no CS query needed
+    for buid in no_cs_buids:
+        metrics["buids_only_count"] += 1
+        buids_only.append(buid)
+        if len(buids_only) >= buid_batch_size:
+            buids_threshold_event.set()
+
     async with httpx.AsyncClient(timeout=60, follow_redirects=True, verify=False, headers=cstools_config["headers"]) as cs_client:
         monitor_task = asyncio.create_task(monitor_batches())
-        await query_all_buids_task(
-            buids=buids,
-            cs_client=cs_client,
-            cstools_config=cstools_config,
-            cs_sem=cs_sem,
-            metrics=metrics,
-            uidCarTerms=uidCarTerms,
-            buids_only=buids_only,
-            uidCarTerms_threshold_event=uidCarTerms_threshold_event,
-            buids_threshold_event=buids_threshold_event,
-            uidcarterm_batch_size=uidcarterm_batch_size,
-            buid_batch_size=buid_batch_size,
+        await asyncio.gather(
+            query_faculty_terms_task(
+                faculty_buids=list(faculty_buid_set),
+                buid_expected=buid_expected,
+                buid_done=buid_done,
+                student_results=student_results,
+                faculty_results=faculty_results,
+                cs_client=cs_client,
+                cstools_config=cstools_config,
+                cs_sem=cs_sem,
+                metrics=metrics,
+                term_buids=term_buids,
+                buids_only=buids_only,
+                term_buids_threshold_event=term_buids_threshold_event,
+                buids_threshold_event=buids_threshold_event,
+                term_batch_size=uidcarterm_batch_size,
+                buid_batch_size=buid_batch_size,
+            ),
+            query_student_terms_task(
+                student_buids=list(student_buid_set),
+                buid_expected=buid_expected,
+                buid_done=buid_done,
+                student_results=student_results,
+                faculty_results=faculty_results,
+                cs_client=cs_client,
+                cstools_config=cstools_config,
+                cs_sem=cs_sem,
+                metrics=metrics,
+                term_buids=term_buids,
+                buids_only=buids_only,
+                term_buids_threshold_event=term_buids_threshold_event,
+                buids_threshold_event=buids_threshold_event,
+                term_batch_size=uidcarterm_batch_size,
+                buid_batch_size=buid_batch_size,
+            ),
+            return_exceptions=True,
         )
         all_cs_done.set()
         await monitor_task
@@ -411,14 +530,19 @@ async def person_raw_flow(
     await heartbeat
 
     elapsed = (datetime.now() - start_time).total_seconds()
-    total_batches = batch_counter["uidcarterms"] + batch_counter["buids"]
+    total_batches = batch_counter["terms"] + batch_counter["buids"]
     total_batches_completed = metrics["uidcarterm_batches_completed"] + metrics["buid_batches_completed"]
 
     logger.info(f"\n✅ PERSON_RAW_FLOW COMPLETE")
-    logger.info(f"   BUIDs: {len(buids):,} total | Students: {metrics['cs_success']:,} ({metrics['uidcarterm_total']:,} terms) | BUIDs only: {metrics['buids_only_count']:,}")
+    logger.info(
+        f"   BUIDs: {len(buids):,} total"
+        f" | Students (PS): {len(student_buid_set):,} ({metrics['student_term_total']:,} terms)"
+        f" | Faculty (VDS): {len(faculty_buid_set):,} ({metrics['faculty_term_total']:,} terms)"
+        f" | BUID-only: {metrics['buids_only_count']:,}"
+    )
     logger.info(f"   Batches: {total_batches_completed} of {total_batches} completed")
     logger.info(f"   Records: {metrics['persons_received']:,} received | {metrics['insert_success']:,} inserted | {metrics['insert_skipped']:,} skipped")
-    logger.info(f"   Errors: CS={metrics['errors']['cs']} API={metrics['errors']['person_api']} DB={metrics['errors']['db']} | Duration: {int(elapsed//3600)}h {int((elapsed%3600)//60)}m {int(elapsed%60)}s")
+    logger.info(f"   Errors: CS-Student={metrics['errors']['cs_student']} CS-Faculty={metrics['errors']['cs_faculty']} API={metrics['errors']['person_api']} DB={metrics['errors']['db']} | Duration: {int(elapsed//3600)}h {int((elapsed%3600)//60)}m {int(elapsed%60)}s")
 
     return {"status": "success", "buids_processed": len(buids), "records_inserted": metrics["insert_success"], "errors": metrics["errors"]}
 
