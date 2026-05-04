@@ -268,7 +268,7 @@ async def person_raw_flow(
                 # ETA estimation
                 if total_cs_done >= n_cs_total and n_cs_total > 0:
                     try:
-                        est_term_batches = batch_counter["uidcarterms"]
+                        est_term_batches = batch_counter["terms"]
                         est_buid_batches = batch_counter["buids"]
                     except (NameError, KeyError):
                         est_term_batches = 0
