@@ -19,7 +19,7 @@ CREATE TABLE term_raw.term_data (
 CREATE TABLE term_xform.current_term_data (
     acad_career       VARCHAR(4)  NOT NULL,
     strm              VARCHAR(4)  NOT NULL,
-    descr             VARCHAR(20) NULL,
+    descr             VARCHAR(50) NULL,
     term_begin_dt     VARCHAR(8)  NULL,
     term_end_dt       VARCHAR(8)  NULL,
     current_ind       VARCHAR(1)  NULL,
@@ -44,7 +44,7 @@ CREATE TABLE term_curated.term_data_by_service (
     service           VARCHAR      NOT NULL,   -- e.g. "active_terms"
     acad_career       VARCHAR(4)   NOT NULL,
     strm              VARCHAR(4)   NOT NULL,
-    descr             VARCHAR(20)  NULL,
+    descr             VARCHAR(50)  NULL,
     term_begin_dt     VARCHAR(8)   NULL,
     term_end_dt       VARCHAR(8)   NULL,
     current_ind       VARCHAR(1)   NULL,

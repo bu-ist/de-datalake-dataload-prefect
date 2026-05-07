@@ -9,7 +9,7 @@ from prefect.logging import get_run_logger
 from flows.utils.db import batch_insert_with_retry
 
 
-@task(name="fetch-active-terms", retries=2, retry_delay_seconds=30, tags=["fetch-terms"])
+@task(name="fetch-active-terms", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE, tags=["fetch-terms"])
 async def fetch_active_terms_task(asyncpg_pool) -> List[str]:
     logger = get_run_logger()
     async with asyncpg_pool.acquire() as conn:

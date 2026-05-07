@@ -40,6 +40,16 @@ async def insert_term_data_task(rows: List[dict], asyncpg_pool) -> int:
 
     records = [(t.get("ACAD_CAREER", ""), t.get("STRM", ""), json.dumps(t)) for t in rows]
 
+    descr_violations = [
+        (t.get("ACAD_CAREER"), t.get("STRM"), t.get("DESCR"))
+        for t in rows
+        if len(t.get("DESCR") or "") > 50
+    ]
+    if descr_violations:
+        logger.warning(f"⚠️  {len(descr_violations)} DESCR value(s) exceed VARCHAR(50):")
+        for career, strm, descr in descr_violations:
+            logger.warning(f"   ACAD_CAREER={career} STRM={strm} DESCR={descr!r} (len={len(descr)})")
+
     async with asyncpg_pool.acquire() as conn:
         async with conn.transaction():
             try:
