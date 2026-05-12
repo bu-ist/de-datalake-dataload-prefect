@@ -219,8 +219,11 @@ async def person_raw_flow(
     insert_semaphore_limit: int = 100,
     uidcarterm_batch_size: int = 600,
     buid_batch_size: int = 100,
+    test_run: bool = False,
 ):
     logger = get_run_logger()
+    if test_run:
+        logger.warning("TEST RUN MODE: database writes skipped")
 
     person_api_config = DEPersonApiResource.get_config()
     cstools_config = CsToolsResource.get_config()
@@ -364,6 +367,7 @@ async def person_raw_flow(
         "first_insert_event": first_insert_event,
         "asyncpg_pool": asyncpg_pool,
         "metrics": metrics,
+        "test_run": test_run,
     })
 
     term_buids: list = []
@@ -449,6 +453,9 @@ async def person_raw_flow(
         Running as a task in person_raw_flow's context keeps the inserts subflow
         as a sibling (not a child) of person_batches_subflow in the Prefect UI."""
         await first_insert_event.wait()
+        if _batch_context.get("test_run"):
+            logger.info("TEST RUN: would start insert subflow — skipping")
+            return
         _batch_context["inserts_task"] = asyncio.create_task(
             person_inserts_subflow(n_workers=insert_semaphore_limit)
         )
@@ -517,11 +524,16 @@ async def person_raw_flow(
     await asyncio.gather(inserts_starter, return_exceptions=True)
 
     # All Person API calls done; drain insert_queue → signal person_inserts_subflow → await it
-    await insert_queue.join()
-    if inserts_task := _batch_context.get("inserts_task"):
-        for _ in range(insert_semaphore_limit):
-            await insert_queue.put(None)
-        await inserts_task
+    if not test_run:
+        await insert_queue.join()
+        if inserts_task := _batch_context.get("inserts_task"):
+            for _ in range(insert_semaphore_limit):
+                await insert_queue.put(None)
+            await inserts_task
+    else:
+        qsize = insert_queue.qsize()
+        if qsize:
+            logger.info(f"TEST RUN: {qsize} insert batches queued — skipping all")
 
     _batch_context.clear()
     await asyncpg_pool.close()

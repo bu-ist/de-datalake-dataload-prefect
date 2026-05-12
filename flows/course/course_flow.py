@@ -8,8 +8,10 @@ from flows.course.course_tasks import fetch_active_terms_task, fetch_course_deta
 
 
 @flow(name="course-raw-flow", description="Retrieves course data from the course API and prepares it for insertion into the Postgres database", retries=1, retry_delay_seconds=300, log_prints=True)
-async def course_raw_flow():
+async def course_raw_flow(test_run: bool = False):
     logger = get_run_logger()
+    if test_run:
+        logger.warning("TEST RUN MODE: database writes skipped")
     INSERT_BATCH_SIZE = 50
     INSERT_SEMAPHORE_LIMIT = 4
 
@@ -36,13 +38,15 @@ async def course_raw_flow():
             for course in term.get("courses", []):
                 courses.append({"academic_career": academic_career, "term_code": term_code, "course_id": course.get("v2", {}).get("courseId", ""), "session_code": course.get("v2", {}).get("sessionCode", ""), "course_data": json.dumps({**course, "termDetails": term_details})})
     
-    insert_sem = asyncio.Semaphore(INSERT_SEMAPHORE_LIMIT)
     metrics = {"insert_success": 0, "errors": 0, "type_skipped": 0, "batches_completed": 0, "batches_total": (len(courses) + INSERT_BATCH_SIZE - 1) // INSERT_BATCH_SIZE}
-    logger.info(f"💾 Inserting {len(courses)} records in {metrics['batches_total']} batches (batch_size={INSERT_BATCH_SIZE}, concurrency={INSERT_SEMAPHORE_LIMIT})")
 
-    tasks = [insert_courses_batch_task(batch=courses[i:i + INSERT_BATCH_SIZE], batch_num=batch_num + 1, total_batches=metrics['batches_total'], asyncpg_pool=asyncpg_pool, insert_sem=insert_sem, metrics=metrics) for batch_num, i in enumerate(range(0, len(courses), INSERT_BATCH_SIZE))]
-
-    await asyncio.gather(*tasks, return_exceptions=True)
+    if not test_run:
+        insert_sem = asyncio.Semaphore(INSERT_SEMAPHORE_LIMIT)
+        logger.info(f"💾 Inserting {len(courses)} records in {metrics['batches_total']} batches (batch_size={INSERT_BATCH_SIZE}, concurrency={INSERT_SEMAPHORE_LIMIT})")
+        tasks = [insert_courses_batch_task(batch=courses[i:i + INSERT_BATCH_SIZE], batch_num=batch_num + 1, total_batches=metrics['batches_total'], asyncpg_pool=asyncpg_pool, insert_sem=insert_sem, metrics=metrics) for batch_num, i in enumerate(range(0, len(courses), INSERT_BATCH_SIZE))]
+        await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        logger.info(f"TEST RUN: would insert {len(courses)} courses — skipping")
 
     await asyncpg_pool.close()
 

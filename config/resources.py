@@ -1,5 +1,4 @@
 import asyncpg
-from typing import Dict
 from config.settings import settings
 
 
@@ -11,7 +10,7 @@ class PostgresResource:
             port=settings.postgres_port,
             database=settings.postgres_db,
             user=settings.postgres_user,
-            password=settings.postgres_pass,
+            password=settings.postgres_pass.get_secret_value(),
             min_size=min_size,
             max_size=max_size,
         )
@@ -19,66 +18,66 @@ class PostgresResource:
 
 class CourseApiResource:
     @staticmethod
-    def get_config() -> Dict[str, any]:
+    def get_config() -> dict:
         return {
             "url": settings.snaplogic_course_url,
             "headers": {
-                "x-api-key": settings.snaplogic_course_key,
-                "User-Agent": "Mozilla/5.0"
+                "x-api-key": settings.snaplogic_course_key.get_secret_value(),
+                "User-Agent": "Mozilla/5.0",
             },
-            "cs_env": settings.cs_env
+            "cs_env": settings.cs_env,
         }
 
 
 class DEPersonApiResource:
     @staticmethod
-    def get_config() -> Dict[str, any]:
+    def get_config() -> dict:
         return {
             "url": settings.de_person_api_url,
             "headers": {
-                "x-api-key": settings.de_person_api_key,
-                "User-Agent": "Mozilla/5.0"
+                "x-api-key": settings.de_person_api_key.get_secret_value(),
+                "User-Agent": "Mozilla/5.0",
             },
-            "cs_env": settings.cs_env
+            "cs_env": settings.cs_env,
         }
 
 
 class CsToolsResource:
     @staticmethod
-    def get_config() -> Dict[str, any]:
+    def get_config() -> dict:
         return {
             "url": settings.de_cstools_endpoint,
             "headers": {
-                "x-api-key": settings.de_cstools_key,
+                "x-api-key": settings.de_cstools_key.get_secret_value(),
                 "User-Agent": "Mozilla/5.0",
-                "Content-Type": "application/json"
-            }
+                "Content-Type": "application/json",
+            },
         }
 
 
 class VDSApiResource:
     @staticmethod
-    def get_config() -> Dict[str, any]:
-        #TODO: Replace Bearer token with proper API key auth once VDS credentials are finalized
+    def get_config() -> dict:
+        # TODO: Replace Bearer token with proper API key auth once VDS credentials are finalized
         return {
             "url": settings.vds_url,
             "headers": {
-                "Authorization": f"Bearer {settings.vds_key}",
-                "User-Agent": "Mozilla/5.0"
-            }
+                "Authorization": f"Bearer {settings.vds_key.get_secret_value()}",
+                "User-Agent": "Mozilla/5.0",
+            },
         }
 
 
 class SAPApiResource:
     @staticmethod
-    def get_config() -> Dict[str, any]:
+    def get_config() -> dict:
         return {
             "url": settings.sap_url,
             "headers": {
-                "x-api-key": settings.sap_key,
-                "User-Agent": "Mozilla/5.0"
-            }
+                "x-api-key": settings.sap_key.get_secret_value(),
+                "User-Agent": "Mozilla/5.0",
+            },
         }
 
 
-#TODO: Add "HOUSING_STAGE"."ETL_CURR_HOUSING_IDS"
+# TODO: Add "HOUSING_STAGE"."ETL_CURR_HOUSING_IDS"

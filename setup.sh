@@ -37,7 +37,7 @@ echo ""
 echo "Initializing Prefect..."
 echo ""
 
-# Set Prefect API URL
+# Set Prefect API URL (local dev only — production uses the cluster-internal Prefect server)
 export PREFECT_API_URL=http://localhost:4200/api
 
 # Check if Prefect server is running

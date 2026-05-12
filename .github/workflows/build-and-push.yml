@@ -1,0 +1,142 @@
+name: Build and Push Container
+
+on:
+  push:
+    branches: [dev, test, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write  # Required for OIDC auth to AWS
+
+env:
+  GHCR_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: flow/de-person-course-term-publish
+  ECR_NONPROD_REGISTRY: 889914499666.dkr.ecr.us-east-1.amazonaws.com
+  ECR_NONPROD_ROLE: arn:aws:iam::889914499666:role/github-actions-ecr-role
+  ECR_PROD_REGISTRY: 388301380638.dkr.ecr.us-east-1.amazonaws.com
+  ECR_PROD_ROLE: arn:aws:iam::388301380638:role/github-actions-ecr-role
+
+jobs:
+  static-checks:
+    name: Static Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dev dependencies
+        run: uv sync --frozen
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: static-checks
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: test
+      POSTGRES_USER: test
+      POSTGRES_PASS: test
+      CS_ENV: test
+      DE_CSTOOLS_ENDPOINT: http://localhost
+      DE_CSTOOLS_KEY: test
+      SNAPLOGIC_COURSE_URL: http://localhost
+      SNAPLOGIC_COURSE_KEY: test
+      DE_PERSON_API_URL: http://localhost
+      DE_PERSON_API_KEY: test
+      VDS_URL: http://localhost
+      VDS_KEY: test
+      SAP_URL: http://localhost
+      SAP_KEY: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run pytest --tb=short -q
+
+  build-and-push:
+    name: Build and Push
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set ECR target
+        id: ecr-target
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "registry=${{ env.ECR_PROD_REGISTRY }}" >> "$GITHUB_OUTPUT"
+            echo "role=${{ env.ECR_PROD_ROLE }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "registry=${{ env.ECR_NONPROD_REGISTRY }}" >> "$GITHUB_OUTPUT"
+            echo "role=${{ env.ECR_NONPROD_ROLE }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.ecr-target.outputs.role }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GHCR_REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ steps.ecr-target.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=test,enable=${{ github.ref == 'refs/heads/test' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value={{date 'YYYYMMDD'}}-{{sha}},enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true

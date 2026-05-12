@@ -1,21 +1,35 @@
-# Prefect Project Configuration
-name: datalake-dataload
-version: 1
+name: de-person-course-term-publish
+prefect-version: "3.0.0"
 
-# Build configuration - no remote storage needed for local development
-build: null
-push: null
-pull: null
+# Set working directory once for all deployments; entrypoints are relative to /app.
+pull:
+  - prefect.deployments.steps.set_working_directory:
+      directory: /app
 
-# Deployments - All three data loading flows
 deployments:
   - name: term-raw-daily
     tags: ["raw", "term", "peoplesoft"]
-    description: "Daily term data load at 1:00 AM ET"
+    description: "Daily term data load from CS Tools at 1:00 AM ET"
     entrypoint: flows/term/term_flow.py:term_raw_flow
     concurrency_limit: 1
     work_pool:
-      name: k8s-pool
+      name: batch-jobs
+      job_variables:
+        image: 889914499666.dkr.ecr.us-east-1.amazonaws.com/flow/de-person-course-term-publish:test
+        image_pull_policy: Always
+        namespace: prefect
+        env_from:
+          - secretRef:
+              name: de-person-course-term-publish-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1"
+    parameters:
+      test_run: false
     schedules:
       - cron: "0 1 * * *"
         timezone: "America/New_York"
@@ -23,23 +37,60 @@ deployments:
 
   - name: course-raw-daily
     tags: ["raw", "course", "snaplogic"]
-    description: "Daily course data load at 2:00 AM ET"
+    description: "Daily course data load from SnapLogic at 2:00 AM ET"
     entrypoint: flows/course/course_flow.py:course_raw_flow
     concurrency_limit: 1
     work_pool:
-      name: k8s-pool
+      name: batch-jobs
+      job_variables:
+        image: 889914499666.dkr.ecr.us-east-1.amazonaws.com/flow/de-person-course-term-publish:test
+        image_pull_policy: Always
+        namespace: prefect
+        env_from:
+          - secretRef:
+              name: de-person-course-term-publish-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+    parameters:
+      test_run: false
     schedules:
       - cron: "0 2 * * *"
         timezone: "America/New_York"
         active: true
 
   - name: person-raw-daily
-    tags: ["raw", "person", "snaplogic"]
-    description: "Daily person data load at 3:00 AM ET"
+    tags: ["raw", "person", "de-person-api"]
+    description: "Daily person data load from DE Person API at 3:00 AM ET"
     entrypoint: flows/person/person_flow.py:person_raw_flow
     concurrency_limit: 1
     work_pool:
-      name: k8s-pool
+      name: batch-jobs
+      job_variables:
+        image: 889914499666.dkr.ecr.us-east-1.amazonaws.com/flow/de-person-course-term-publish:test
+        image_pull_policy: Always
+        namespace: prefect
+        env_from:
+          - secretRef:
+              name: de-person-course-term-publish-secrets
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "500m"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+    parameters:
+      cstools_semaphore_limit: 10
+      person_api_semaphore_limit: 5
+      insert_semaphore_limit: 100
+      uidcarterm_batch_size: 600
+      buid_batch_size: 100
+      test_run: false
     schedules:
       - cron: "0 3 * * *"
         timezone: "America/New_York"

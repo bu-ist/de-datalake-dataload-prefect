@@ -1,0 +1,18 @@
+import os
+
+os.environ.setdefault("POSTGRES_HOST", "localhost")
+os.environ.setdefault("POSTGRES_PORT", "5432")
+os.environ.setdefault("POSTGRES_DB", "test")
+os.environ.setdefault("POSTGRES_USER", "test")
+os.environ.setdefault("POSTGRES_PASS", "test")
+os.environ.setdefault("CS_ENV", "test")
+os.environ.setdefault("DE_CSTOOLS_ENDPOINT", "http://localhost")
+os.environ.setdefault("DE_CSTOOLS_KEY", "test")
+os.environ.setdefault("SNAPLOGIC_COURSE_URL", "http://localhost")
+os.environ.setdefault("SNAPLOGIC_COURSE_KEY", "test")
+os.environ.setdefault("DE_PERSON_API_URL", "http://localhost")
+os.environ.setdefault("DE_PERSON_API_KEY", "test")
+os.environ.setdefault("VDS_URL", "http://localhost")
+os.environ.setdefault("VDS_KEY", "test")
+os.environ.setdefault("SAP_URL", "http://localhost")
+os.environ.setdefault("SAP_KEY", "test")

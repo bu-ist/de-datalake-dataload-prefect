@@ -1,46 +1,45 @@
-# --- Builder Stage ---
-FROM python:3.13-slim AS builder
+# syntax=docker/dockerfile:1
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
 
-WORKDIR /opt/prefect/app
+WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
 
-# Copy requirements file for caching layers
-COPY requirements.txt .
+# Dependencies first — cached layer when only flow code changes.
+COPY pyproject.toml uv.lock* ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
 
-# Install Python build tools and dependencies
-RUN pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.txt
+# Flow and config code.
+COPY flows ./flows
+COPY config ./config
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
 
-# Copy the rest of the source code
-COPY . .
 
-# --- Runtime Stage ---
-FROM python:3.13-slim AS runtime
+FROM python:3.13-slim-bookworm AS runtime
 
-WORKDIR /opt/prefect/app
+WORKDIR /app
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed Python packages and CLI scripts from builder
-COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-COPY --from=builder /opt/prefect/app /opt/prefect/app
+RUN groupadd --gid 1000 flowuser && \
+    useradd --uid 1000 --gid flowuser --no-create-home --shell /usr/sbin/nologin flowuser
 
-# Set Python environment flags
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/opt/prefect/app
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/flows ./flows
+COPY --from=builder /app/config ./config
 
-# Expose port for Prefect agent
-EXPOSE 8080
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
-# Default command: run Prefect worker
-CMD ["prefect", "worker", "start", "--pool", "default-agent-pool"]
+USER flowuser
+
+# Flow-runner image — the Prefect worker overrides CMD with `prefect flow-run execute ...`.
+# Running this image directly will only print this message.
+CMD ["python", "-c", "print('de-person-course-term-publish — invoked by Prefect worker, not run directly')"]

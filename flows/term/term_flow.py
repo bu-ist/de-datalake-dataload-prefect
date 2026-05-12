@@ -7,9 +7,11 @@ from flows.utils.logging_helpers import log_step_header
 
 
 @flow(name="term-raw-flow", description="Retrieves terms from BU_TERM_QRY via Campus Solutions Tools API and prepares it for insertion into the Postgres database", retries=1, retry_delay_seconds=300, log_prints=True)
-async def term_raw_flow():
+async def term_raw_flow(test_run: bool = False):
     logger = get_run_logger()
     flow_start = datetime.now()
+    if test_run:
+        logger.warning("TEST RUN MODE: database writes skipped")
     logger.info("🚀 TERM_RAW_FLOW STARTING")
 
     asyncpg_pool = await PostgresResource.get_pool()
@@ -18,11 +20,15 @@ async def term_raw_flow():
     log_step_header(logger, 1, "Fetching term data from Campus Solutions Tools")
     rows = await fetch_terms_from_cs_tools_task(cstools_config)
 
-    log_step_header(logger, 2, "Inserting data into database")
-    records_inserted = await insert_term_data_task(rows, asyncpg_pool)
+    records_inserted = 0
+    if not test_run:
+        log_step_header(logger, 2, "Inserting data into database")
+        records_inserted = await insert_term_data_task(rows, asyncpg_pool)
+    else:
+        logger.info(f"TEST RUN: would insert {len(rows)} rows — skipping")
 
     await asyncpg_pool.close()
-    
+
     flow_duration = (datetime.now() - flow_start).total_seconds()
     logger.info(f"\n✅ TERM_RAW_FLOW COMPLETE - Records: {records_inserted:,} | Duration: {flow_duration:.2f}s | Status: SUCCESS")
 
